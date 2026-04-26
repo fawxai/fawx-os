@@ -17,7 +17,8 @@ use fawx_harness::{
     satisfy_external_condition, satisfy_human_handoff,
 };
 use fawx_kernel::{
-    ActionBoundary, ActionBoundaryState, AgentActionStatus, AgentActivityTarget, TaskBlocker,
+    ActionBoundary, ActionBoundaryState, AgentActionStatus, AgentActivityTarget,
+    HumanHandoffResumeCondition, TaskBlocker,
 };
 use fawx_task_store::{StoredTask, TaskStore, TaskStoreError, TaskStoreTransitionError};
 use serde::{Deserialize, Serialize};
@@ -307,7 +308,7 @@ fn scoped_observations_for_task(
     state: &TaskState,
     observations: &[BackgroundObservation],
 ) -> (Vec<RuntimeObservation>, Option<String>) {
-    let expected_foreground_package = expected_foreground_package_from_current_action(state);
+    let expected_foreground_package = expected_foreground_package_from_task_state(state);
     let mut scoped = Vec::new();
     for observation in observations {
         match &observation.scope {
@@ -332,6 +333,11 @@ fn scoped_observations_for_task(
     (scoped, expected_foreground_package)
 }
 
+fn expected_foreground_package_from_task_state(state: &TaskState) -> Option<String> {
+    expected_foreground_package_from_current_action(state)
+        .or_else(|| expected_foreground_package_from_current_handoff(state))
+}
+
 fn expected_foreground_package_from_current_action(state: &TaskState) -> Option<String> {
     match state.current_action.as_ref() {
         Some(action)
@@ -344,6 +350,24 @@ fn expected_foreground_package_from_current_action(state: &TaskState) -> Option<
                 }
                 _ => None,
             }
+        }
+        _ => None,
+    }
+}
+
+fn expected_foreground_package_from_current_handoff(state: &TaskState) -> Option<String> {
+    match state
+        .current_handoff
+        .as_ref()
+        .map(|handoff| &handoff.resume_condition)
+    {
+        Some(HumanHandoffResumeCondition::ForegroundPackage { package_name })
+            if matches!(
+                state.blocker,
+                Some(TaskBlocker::WaitingForForeground { .. })
+            ) =>
+        {
+            Some(package_name.clone())
         }
         _ => None,
     }
@@ -821,6 +845,50 @@ mod tests {
         let action = task.state.current_action.expect("current action");
         assert_eq!(action.status, AgentActionStatus::Executing);
         assert_eq!(action.boundary.state, ActionBoundaryState::Prepared);
+    }
+
+    #[test]
+    fn background_runner_clears_task_scoped_foreground_handoff() {
+        let (store, runner) = test_background_runner();
+        store
+            .create(TaskState::new_background_task(
+                "task-settings-handoff",
+                "wait for settings",
+            ))
+            .expect("create task");
+        AgentLoop::new(store.clone())
+            .step(LoopStepRequest {
+                task_id: "task-settings-handoff".to_string(),
+                observations: vec![],
+                expected_foreground_package: Some("com.android.settings".to_string()),
+                model_activity: None,
+                model_action: None,
+            })
+            .expect("create foreground handoff");
+
+        let result = runner
+            .tick(BackgroundTickRequest {
+                tick_id: 5,
+                observations: vec![BackgroundObservation::for_task(
+                    "task-settings-handoff",
+                    android_foreground("com.android.settings"),
+                )],
+            })
+            .expect("background tick");
+
+        assert!(matches!(
+            result.tasks[0].outcome,
+            BackgroundTaskTickOutcome::Stepped {
+                decision: LoopDecision {
+                    next_action: NextAction::ContinueLocalWork { .. },
+                    ..
+                }
+            }
+        ));
+        let task = store.load("task-settings-handoff").expect("load task");
+        assert!(task.state.blocker.is_none());
+        assert!(task.state.current_handoff.is_none());
+        assert_eq!(task.state.completed_handoffs.len(), 1);
     }
 
     #[test]

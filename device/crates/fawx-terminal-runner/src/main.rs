@@ -19,8 +19,8 @@ use fawx_harness::{
     satisfy_human_handoff,
 };
 use fawx_kernel::{
-    ActionBoundary, ActionBoundaryState, AgentActionStatus, AgentActivityTarget, SafetyCapability,
-    SafetyGrant, SafetyScope,
+    ActionBoundary, ActionBoundaryState, AgentActionStatus, AgentActivityTarget,
+    HumanHandoffResumeCondition, SafetyCapability, SafetyGrant, SafetyScope, TaskBlocker,
 };
 use fawx_task_store::{StoredTask, TaskStore, default_task_store_path};
 
@@ -393,7 +393,7 @@ fn scoped_foreground_observations(
     };
     let matching_task_ids = tasks
         .iter()
-        .filter(|task| task_expects_executing_foreground_package(&task.state, observed_package))
+        .filter(|task| task_expects_foreground_package(&task.state, observed_package))
         .map(|task| task.state.task_id.as_str())
         .collect::<Vec<_>>();
 
@@ -417,6 +417,11 @@ fn foreground_package_from_runtime_observation(observation: &RuntimeObservation)
     }
 }
 
+fn task_expects_foreground_package(state: &TaskState, observed_package: &str) -> bool {
+    task_expects_executing_foreground_package(state, observed_package)
+        || task_expects_handoff_foreground_package(state, observed_package)
+}
+
 fn task_expects_executing_foreground_package(state: &TaskState, observed_package: &str) -> bool {
     state.current_action.as_ref().is_some_and(|action| {
         action.status == AgentActionStatus::Executing
@@ -426,6 +431,19 @@ fn task_expects_executing_foreground_package(state: &TaskState, observed_package
                 Some(AgentActivityTarget::AndroidPackage { package_name })
                     if package_name == observed_package
             )
+    })
+}
+
+fn task_expects_handoff_foreground_package(state: &TaskState, observed_package: &str) -> bool {
+    matches!(
+        state.blocker,
+        Some(TaskBlocker::WaitingForForeground { .. })
+    ) && state.current_handoff.as_ref().is_some_and(|handoff| {
+        matches!(
+            &handoff.resume_condition,
+            HumanHandoffResumeCondition::ForegroundPackage { package_name }
+                if package_name == observed_package
+        )
     })
 }
 
@@ -897,6 +915,24 @@ mod tests {
         }
     }
 
+    fn create_foreground_handoff(store: &TaskStore, task_id: &str, package_name: &str) {
+        store
+            .create(TaskState::new_background_task(
+                task_id,
+                "wait for foreground",
+            ))
+            .expect("create task");
+        AgentLoop::new(store.clone())
+            .step(LoopStepRequest {
+                task_id: task_id.to_string(),
+                observations: vec![],
+                expected_foreground_package: Some(package_name.to_string()),
+                model_activity: None,
+                model_action: None,
+            })
+            .expect("create foreground handoff");
+    }
+
     #[test]
     fn manual_checkpoint_uses_harness_blocker_guard() {
         let mut state = TaskState::new_background_task("task-1", "watch settings");
@@ -985,6 +1021,44 @@ mod tests {
             fawx_agent_loop::BackgroundObservationScope::Task { ref task_id }
                 if task_id == "task-executing-launcher"
         ));
+    }
+
+    #[test]
+    fn foreground_scoping_routes_to_single_matching_handoff() {
+        let store = test_store();
+        create_foreground_handoff(&store, "task-settings-handoff", "com.android.settings");
+
+        let observations = scoped_foreground_observations(
+            &store.list().expect("list tasks"),
+            &foreground("com.android.settings"),
+            None,
+        )
+        .expect("scope foreground");
+
+        assert_eq!(observations.len(), 1);
+        assert!(matches!(
+            observations[0].scope,
+            fawx_agent_loop::BackgroundObservationScope::Task { ref task_id }
+                if task_id == "task-settings-handoff"
+        ));
+    }
+
+    #[test]
+    fn foreground_scoping_rejects_ambiguous_action_and_handoff_matches() {
+        let store = test_store();
+        create_open_app_action(&store, "task-action", "com.android.settings", true);
+        create_foreground_handoff(&store, "task-handoff", "com.android.settings");
+
+        let error = scoped_foreground_observations(
+            &store.list().expect("list tasks"),
+            &foreground("com.android.settings"),
+            None,
+        )
+        .expect_err("ambiguous foreground ownership should fail");
+
+        assert!(error.contains("ambiguous foreground observation"));
+        assert!(error.contains("task-action"));
+        assert!(error.contains("task-handoff"));
     }
 
     #[test]
