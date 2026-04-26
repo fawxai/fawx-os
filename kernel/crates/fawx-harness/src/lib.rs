@@ -5,7 +5,8 @@
 
 pub use fawx_kernel::TaskPhase;
 use fawx_kernel::{
-    ActionBoundary, AgentActivity, AgentActivityKind, AgentActivitySource, AgentActivityTarget,
+    ActionBoundary, ActionBoundaryState, AgentAction, AgentActionKind, AgentActionStatus,
+    AgentActivity, AgentActivityKind, AgentActivitySource, AgentActivityTarget,
     AttentionRequirement, ExecutionContract, TaskBlocker, TaskCheckpoint,
 };
 use serde::{Deserialize, Serialize};
@@ -86,6 +87,10 @@ pub struct TaskState {
     #[serde(default)]
     pub current_activity: Option<AgentActivity>,
     #[serde(default)]
+    pub current_action: Option<AgentAction>,
+    #[serde(default)]
+    pub action_sequence: u64,
+    #[serde(default)]
     pub last_runtime_observation: Option<RuntimeObservation>,
 }
 
@@ -106,8 +111,15 @@ impl TaskState {
             checkpoint: None,
             blocker: None,
             current_activity: None,
+            current_action: None,
+            action_sequence: 0,
             last_runtime_observation: None,
         }
+    }
+
+    fn next_action_index(&mut self) -> u64 {
+        self.action_sequence = self.action_sequence.saturating_add(1);
+        self.action_sequence
     }
 }
 
@@ -132,6 +144,10 @@ pub enum TaskTransitionError {
         task_id: String,
         reason: String,
     },
+    InvalidAction {
+        task_id: String,
+        reason: String,
+    },
 }
 
 impl Display for TaskTransitionError {
@@ -146,6 +162,9 @@ impl Display for TaskTransitionError {
             Self::CheckpointClock => write!(f, "could not timestamp checkpoint"),
             Self::InvalidActivity { task_id, reason } => {
                 write!(f, "task {task_id} rejected activity: {reason}")
+            }
+            Self::InvalidAction { task_id, reason } => {
+                write!(f, "task {task_id} rejected action: {reason}")
             }
         }
     }
@@ -181,6 +200,46 @@ impl From<ModelActivityKind> for AgentActivityKind {
             ModelActivityKind::Executing => Self::Executing,
             ModelActivityKind::Verifying => Self::Verifying,
             ModelActivityKind::Summarizing => Self::Summarizing,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelActionProposal {
+    pub kind: ModelActionKind,
+    pub target: Option<AgentActivityTarget>,
+    pub reason: String,
+    #[serde(default)]
+    pub expected_observation: Option<String>,
+    #[serde(default)]
+    pub proposal_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelActionKind {
+    Observe,
+    Navigate,
+    OpenApp,
+    Interact,
+    Read,
+    Write,
+    Communicate,
+    Execute,
+    Verify,
+}
+
+impl From<ModelActionKind> for AgentActionKind {
+    fn from(kind: ModelActionKind) -> Self {
+        match kind {
+            ModelActionKind::Observe => Self::Observe,
+            ModelActionKind::Navigate => Self::Navigate,
+            ModelActionKind::OpenApp => Self::OpenApp,
+            ModelActionKind::Interact => Self::Interact,
+            ModelActionKind::Read => Self::Read,
+            ModelActionKind::Write => Self::Write,
+            ModelActionKind::Communicate => Self::Communicate,
+            ModelActionKind::Execute => Self::Execute,
+            ModelActionKind::Verify => Self::Verify,
         }
     }
 }
@@ -304,6 +363,113 @@ pub fn record_model_declared_activity(
     Ok(state)
 }
 
+pub fn accept_model_action_proposal(
+    state: TaskState,
+    proposal: ModelActionProposal,
+) -> Result<TaskState, TaskTransitionError> {
+    ensure_not_terminal(&state)?;
+    if let Some(blocker) = state.blocker.clone() {
+        return Err(TaskTransitionError::BlockedTask {
+            task_id: state.task_id,
+            blocker,
+        });
+    }
+    let reason = proposal.reason.trim();
+    if reason.is_empty() {
+        return Err(TaskTransitionError::InvalidAction {
+            task_id: state.task_id,
+            reason: "action reason must not be empty".to_string(),
+        });
+    }
+    validate_action_target(&proposal.kind, &proposal.target).map_err(|reason| {
+        TaskTransitionError::InvalidAction {
+            task_id: state.task_id.clone(),
+            reason,
+        }
+    })?;
+    let expected_observation = proposal
+        .expected_observation
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let mut state = state;
+    let boundary_id = proposal
+        .proposal_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|proposal_id| {
+            if proposal_id.starts_with(&format!("model-action:{}:", state.task_id)) {
+                Err(TaskTransitionError::InvalidAction {
+                    task_id: state.task_id.clone(),
+                    reason: "proposal_id must not use the kernel-generated action namespace"
+                        .to_string(),
+                })
+            } else {
+                Ok(proposal_id)
+            }
+        })
+        .transpose()?
+        .unwrap_or_else(|| {
+            let task_id = state.task_id.clone();
+            let action_index = state.next_action_index();
+            format!("model-action:{}:{}", task_id, action_index)
+        });
+
+    state.current_action = Some(
+        AgentAction::new(
+            proposal.kind.into(),
+            proposal.target,
+            reason,
+            expected_observation,
+            ActionBoundary::new(boundary_id, ActionBoundaryState::Planned, reason),
+        )
+        .map_err(|_| TaskTransitionError::CheckpointClock)?,
+    );
+    Ok(state)
+}
+
+fn validate_action_target(
+    kind: &ModelActionKind,
+    target: &Option<AgentActivityTarget>,
+) -> Result<(), String> {
+    let valid = match kind {
+        ModelActionKind::Observe | ModelActionKind::Verify => true,
+        ModelActionKind::OpenApp => {
+            matches!(target, Some(AgentActivityTarget::AndroidPackage { .. }))
+        }
+        ModelActionKind::Navigate => matches!(target, Some(AgentActivityTarget::Url { .. })),
+        ModelActionKind::Read | ModelActionKind::Write => matches!(
+            target,
+            Some(AgentActivityTarget::File { .. })
+                | Some(AgentActivityTarget::Url { .. })
+                | Some(AgentActivityTarget::Service { .. })
+        ),
+        ModelActionKind::Interact => matches!(
+            target,
+            Some(AgentActivityTarget::AndroidPackage { .. })
+                | Some(AgentActivityTarget::Url { .. })
+                | Some(AgentActivityTarget::File { .. })
+                | Some(AgentActivityTarget::Service { .. })
+                | Some(AgentActivityTarget::Contact { .. })
+                | Some(AgentActivityTarget::Network)
+                | Some(AgentActivityTarget::RuntimeAction { .. })
+                | Some(AgentActivityTarget::Task)
+        ),
+        ModelActionKind::Communicate => matches!(
+            target,
+            Some(AgentActivityTarget::Contact { .. }) | Some(AgentActivityTarget::Service { .. })
+        ),
+        ModelActionKind::Execute => matches!(
+            target,
+            Some(AgentActivityTarget::RuntimeAction { .. })
+                | Some(AgentActivityTarget::Service { .. })
+        ),
+    };
+
+    valid
+        .then_some(())
+        .ok_or_else(|| format!("action kind {kind:?} requires a compatible typed target"))
+}
+
 pub fn record_current_blocker_activity(state: TaskState) -> Result<TaskState, TaskTransitionError> {
     ensure_not_terminal(&state)?;
     let mut state = state;
@@ -315,10 +481,43 @@ pub fn record_current_blocker_activity(state: TaskState) -> Result<TaskState, Ta
     if !existing_activity_matches_blocker {
         state.current_activity = blocker_activity(&state.blocker)?;
     }
+    mark_current_action(state, AgentActionStatus::Blocked)
+}
+
+fn mark_current_action(
+    mut state: TaskState,
+    status: AgentActionStatus,
+) -> Result<TaskState, TaskTransitionError> {
+    if let Some(action) = state.current_action.as_mut() {
+        action.status = status;
+        action.boundary.state = match status {
+            AgentActionStatus::Accepted | AgentActionStatus::Executing => action.boundary.state,
+            AgentActionStatus::Observed => ActionBoundaryState::Committed,
+            AgentActionStatus::Verified => ActionBoundaryState::Verified,
+            AgentActionStatus::Blocked | AgentActionStatus::Failed => ActionBoundaryState::Aborted,
+        };
+    }
     Ok(state)
 }
 
 pub fn clear_agent_activity(mut state: TaskState) -> TaskState {
+    let status = if state.phase == TaskPhase::Completed {
+        Some(AgentActionStatus::Verified)
+    } else if state.phase == TaskPhase::Failed {
+        Some(AgentActionStatus::Failed)
+    } else {
+        None
+    };
+    if let Some(status) = status
+        && let Some(action) = state.current_action.as_mut()
+    {
+        action.status = status;
+        action.boundary.state = match status {
+            AgentActionStatus::Verified => ActionBoundaryState::Verified,
+            AgentActionStatus::Failed => ActionBoundaryState::Aborted,
+            _ => action.boundary.state,
+        };
+    }
     state.current_activity = None;
     state
 }
@@ -405,8 +604,10 @@ fn foreground_available(
             }),
             "foreground observation accepted",
         )?);
+        state = mark_current_action(state, AgentActionStatus::Observed)?;
     } else {
         state.current_activity = blocker_activity(&blocker)?;
+        state = mark_current_action(state, AgentActionStatus::Blocked)?;
     }
 
     Ok(state)
@@ -436,7 +637,7 @@ fn foreground_required(
     state.blocker = blocker.clone();
     state.last_runtime_observation = observation;
     state.current_activity = blocker_activity_with_target(&blocker, target)?;
-    Ok(state)
+    mark_current_action(state, AgentActionStatus::Blocked)
 }
 
 fn external_condition_satisfied(
@@ -467,8 +668,10 @@ fn external_condition_satisfied(
             Some(AgentActivityTarget::Network),
             "external condition satisfied",
         )?);
+        state = mark_current_action(state, AgentActionStatus::Observed)?;
     } else {
         state.current_activity = blocker_activity(&blocker)?;
+        state = mark_current_action(state, AgentActionStatus::Blocked)?;
     }
 
     Ok(state)
@@ -498,7 +701,7 @@ fn external_condition_required(
     state.blocker = blocker.clone();
     state.last_runtime_observation = observation;
     state.current_activity = blocker_activity(&blocker)?;
-    Ok(state)
+    mark_current_action(state, AgentActionStatus::Blocked)
 }
 
 fn ensure_not_terminal(state: &TaskState) -> Result<(), TaskTransitionError> {
@@ -639,6 +842,8 @@ mod tests {
                 reason: "waiting for provider confirmation".to_string(),
             }),
             current_activity: None,
+            current_action: None,
+            action_sequence: 0,
             last_runtime_observation: None,
         };
 
@@ -663,6 +868,8 @@ mod tests {
                 reason: "checkout flow needs active app focus".to_string(),
             }),
             current_activity: None,
+            current_action: None,
+            action_sequence: 0,
             last_runtime_observation: None,
         };
 
@@ -696,6 +903,8 @@ mod tests {
 
         assert_eq!(state.task_id, "task-1");
         assert!(state.current_activity.is_none());
+        assert!(state.current_action.is_none());
+        assert_eq!(state.action_sequence, 0);
     }
 
     #[test]
@@ -757,6 +966,183 @@ mod tests {
             .expect_err("waiting must not be in the model-declared schema");
 
         assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn model_action_proposal_records_accepted_action_boundary() {
+        let state = TaskState::new_background_task("task-1", "open settings");
+
+        let state = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                reason: "open settings to inspect permissions".to_string(),
+                expected_observation: Some("settings is foreground".to_string()),
+                proposal_id: None,
+            },
+        )
+        .expect("accept action");
+
+        let action = state.current_action.expect("current action");
+        assert_eq!(action.kind, AgentActionKind::OpenApp);
+        assert_eq!(action.status, fawx_kernel::AgentActionStatus::Accepted);
+        assert_eq!(action.reason, "open settings to inspect permissions");
+        assert_eq!(
+            action.expected_observation.as_deref(),
+            Some("settings is foreground")
+        );
+        assert_eq!(action.boundary.id, "model-action:task-1:1");
+        assert_eq!(action.boundary.state, ActionBoundaryState::Planned);
+        assert!(matches!(
+            action.target,
+            Some(AgentActivityTarget::AndroidPackage { package_name })
+                if package_name == "com.android.settings"
+        ));
+    }
+
+    #[test]
+    fn model_action_proposal_rejects_blocked_tasks() {
+        let mut state = TaskState::new_background_task("task-1", "approve checkout");
+        state.blocker = Some(TaskBlocker::WaitingForUserApproval {
+            reason: "approve checkout".to_string(),
+        });
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::Interact,
+                target: Some(AgentActivityTarget::Task),
+                reason: "click approve anyway".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("blocked action should reject");
+
+        assert!(matches!(error, TaskTransitionError::BlockedTask { .. }));
+    }
+
+    #[test]
+    fn model_action_proposal_rejects_empty_reason() {
+        let state = TaskState::new_background_task("task-1", "open settings");
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::Task),
+                reason: "   ".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("empty reason should reject");
+
+        assert!(matches!(error, TaskTransitionError::InvalidAction { .. }));
+    }
+
+    #[test]
+    fn model_action_proposal_rejects_concrete_action_without_compatible_target() {
+        let state = TaskState::new_background_task("task-1", "open settings");
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: None,
+                reason: "open settings".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("open app action without android package should reject");
+
+        assert!(matches!(error, TaskTransitionError::InvalidAction { .. }));
+    }
+
+    #[test]
+    fn model_action_proposal_generates_distinct_boundary_ids() {
+        let state = TaskState::new_background_task("task-1", "open settings");
+        let state = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::Observe,
+                target: None,
+                reason: "observe first".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect("accept first action");
+        assert_eq!(
+            state
+                .current_action
+                .as_ref()
+                .map(|action| action.boundary.id.as_str()),
+            Some("model-action:task-1:1")
+        );
+
+        let state = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::Observe,
+                target: None,
+                reason: "observe second".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect("accept second action");
+
+        assert_eq!(
+            state
+                .current_action
+                .as_ref()
+                .map(|action| action.boundary.id.as_str()),
+            Some("model-action:task-1:2")
+        );
+        assert_eq!(state.action_sequence, 2);
+    }
+
+    #[test]
+    fn model_action_proposal_rejects_generated_namespace_proposal_id() {
+        let state = TaskState::new_background_task("task-1", "open settings");
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::Observe,
+                target: None,
+                reason: "observe".to_string(),
+                expected_observation: None,
+                proposal_id: Some("model-action:task-1:1".to_string()),
+            },
+        )
+        .expect_err("caller must not use generated namespace");
+
+        assert!(matches!(error, TaskTransitionError::InvalidAction { .. }));
+    }
+
+    #[test]
+    fn model_action_proposal_rejects_unknown_for_concrete_interaction() {
+        let state = TaskState::new_background_task("task-1", "interact");
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::Interact,
+                target: Some(AgentActivityTarget::Unknown),
+                reason: "interact somehow".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("unknown target should reject for concrete action");
+
+        assert!(matches!(error, TaskTransitionError::InvalidAction { .. }));
     }
 
     #[test]

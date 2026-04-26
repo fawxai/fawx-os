@@ -9,10 +9,11 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use fawx_harness::{
-    ForegroundPolicyDecision, ModelActivityProposal, RuntimeEvent, RuntimeObservation, TaskPhase,
-    TaskState, TaskTransitionError, apply_foreground_policy, clear_agent_activity,
-    record_action_checkpoint, record_current_blocker_activity, record_model_declared_activity,
-    record_planning_activity, require_external_condition, require_foreground_attention_for_package,
+    ForegroundPolicyDecision, ModelActionProposal, ModelActivityProposal, RuntimeEvent,
+    RuntimeObservation, TaskPhase, TaskState, TaskTransitionError, accept_model_action_proposal,
+    apply_foreground_policy, clear_agent_activity, record_action_checkpoint,
+    record_current_blocker_activity, record_model_declared_activity, record_planning_activity,
+    require_external_condition, require_foreground_attention_for_package,
     satisfy_external_condition,
 };
 use fawx_kernel::{ActionBoundary, ActionBoundaryState, TaskBlocker};
@@ -26,6 +27,8 @@ pub struct LoopStepRequest {
     pub expected_foreground_package: Option<String>,
     #[serde(default)]
     pub model_activity: Option<ModelActivityProposal>,
+    #[serde(default)]
+    pub model_action: Option<ModelActionProposal>,
 }
 
 impl LoopStepRequest {
@@ -35,6 +38,7 @@ impl LoopStepRequest {
             observations: vec![],
             expected_foreground_package: None,
             model_activity: None,
+            model_action: None,
         }
     }
 }
@@ -157,7 +161,7 @@ fn reduce_step(
         ));
     }
 
-    let mut state = state;
+    let mut state = maybe_accept_model_action(state, request)?;
     let mut latest_foreground_observation = None;
     let expects_foreground = request.expected_foreground_package.is_some();
     for observation in &request.observations {
@@ -221,7 +225,7 @@ fn reduce_step(
                 "agent loop accepted task for local planning",
             ),
         )?;
-        let state = record_continue_activity(state, request, "planning local work")?;
+        let state = record_continue_state(state, request, "planning local work")?;
         return Ok(decision_for(
             state,
             NextAction::ContinueLocalWork {
@@ -232,7 +236,7 @@ fn reduce_step(
     }
 
     Ok(decision_for(
-        record_continue_activity(state, request, "continuing local planning from checkpoint")?,
+        record_continue_state(state, request, "continuing local planning from checkpoint")?,
         NextAction::ContinueLocalWork {
             reason: "task already has a checkpoint and can continue local planning".to_string(),
             checkpoint_id: None,
@@ -300,23 +304,43 @@ fn decision_for(state: TaskState, next_action: NextAction) -> (TaskState, LoopDe
     (state, decision)
 }
 
-fn record_continue_activity(
+fn record_continue_state(
     state: TaskState,
     request: &LoopStepRequest,
     description: impl Into<String>,
 ) -> Result<TaskState, TaskTransitionError> {
-    if let Some(model_activity) = request.model_activity.clone() {
+    let state = if let Some(model_activity) = request.model_activity.clone() {
         record_model_declared_activity(state, model_activity)
     } else {
         record_planning_activity(state, description)
+    }?;
+
+    if state.current_action.is_none() {
+        maybe_accept_model_action(state, request)
+    } else {
+        Ok(state)
+    }
+}
+
+fn maybe_accept_model_action(
+    state: TaskState,
+    request: &LoopStepRequest,
+) -> Result<TaskState, TaskTransitionError> {
+    if let Some(model_action) = request.model_action.clone() {
+        accept_model_action_proposal(state, model_action)
+    } else {
+        Ok(state)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fawx_harness::{ModelActivityKind, RuntimeObservationSource, TaskState};
-    use fawx_kernel::{AgentActivityKind, AgentActivitySource, AgentActivityTarget};
+    use fawx_harness::{ModelActionKind, ModelActivityKind, RuntimeObservationSource, TaskState};
+    use fawx_kernel::{
+        AgentActionKind, AgentActionStatus, AgentActivityKind, AgentActivitySource,
+        AgentActivityTarget,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -411,6 +435,7 @@ mod tests {
                     }),
                     description: "checking settings state".to_string(),
                 }),
+                model_action: None,
             })
             .expect("step task");
 
@@ -435,6 +460,56 @@ mod tests {
     }
 
     #[test]
+    fn model_action_proposal_is_accepted_on_unblocked_continue() {
+        let (store, loop_runner) = test_loop();
+        store
+            .create(TaskState::new_background_task("task-1", "open settings"))
+            .expect("create task");
+
+        let result = loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.android.settings".to_string(),
+                    }),
+                    reason: "open settings to inspect permissions".to_string(),
+                    expected_observation: Some("settings is foreground".to_string()),
+                    proposal_id: None,
+                }),
+            })
+            .expect("step task");
+
+        assert!(matches!(
+            result.decision.next_action,
+            NextAction::ContinueLocalWork { .. }
+        ));
+        let action = result
+            .task
+            .state
+            .current_action
+            .as_ref()
+            .expect("current action");
+        assert_eq!(action.kind, AgentActionKind::OpenApp);
+        assert_eq!(action.status, AgentActionStatus::Accepted);
+        assert_eq!(action.reason, "open settings to inspect permissions");
+        assert_eq!(
+            action.expected_observation.as_deref(),
+            Some("settings is foreground")
+        );
+        assert_eq!(action.boundary.id, "model-action:task-1:1");
+        assert!(matches!(
+            action.target.as_ref(),
+            Some(AgentActivityTarget::AndroidPackage { package_name })
+                if package_name == "com.android.settings"
+        ));
+    }
+
+    #[test]
     fn model_declared_activity_cannot_override_blocker_activity() {
         let (store, loop_runner) = test_loop();
         store
@@ -446,6 +521,7 @@ mod tests {
                 observations: vec![],
                 expected_foreground_package: Some("com.android.settings".to_string()),
                 model_activity: None,
+                model_action: None,
             })
             .expect("block task");
 
@@ -459,6 +535,7 @@ mod tests {
                     target: Some(AgentActivityTarget::Task),
                     description: "planning despite blocker".to_string(),
                 }),
+                model_action: None,
             })
             .expect("blocked model activity should preserve blocker");
 
@@ -474,6 +551,44 @@ mod tests {
                 .as_ref()
                 .map(|activity| activity.kind),
             Some(AgentActivityKind::Waiting)
+        ));
+    }
+
+    #[test]
+    fn model_action_proposal_rejects_when_task_is_already_blocked() {
+        let (store, loop_runner) = test_loop();
+        store
+            .create(TaskState::new_background_task("task-1", "inspect settings"))
+            .expect("create task");
+        loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![],
+                expected_foreground_package: Some("com.android.settings".to_string()),
+                model_activity: None,
+                model_action: None,
+            })
+            .expect("block task");
+
+        let error = loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::Interact,
+                    target: Some(AgentActivityTarget::Task),
+                    reason: "interact despite blocker".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                }),
+            })
+            .expect_err("blocked action should reject");
+
+        assert!(matches!(
+            error,
+            AgentLoopError::Transition(TaskTransitionError::BlockedTask { .. })
         ));
     }
 
@@ -500,6 +615,7 @@ mod tests {
                     target: Some(AgentActivityTarget::Task),
                     description: "trying to reopen work".to_string(),
                 }),
+                model_action: None,
             })
             .expect("step terminal task");
 
@@ -510,6 +626,262 @@ mod tests {
             }
         );
         assert!(result.task.state.current_activity.is_none());
+    }
+
+    #[test]
+    fn terminal_task_ignores_model_action_without_reopening_work() {
+        let (store, loop_runner) = test_loop();
+        store
+            .create(TaskState::new_background_task("task-1", "already done"))
+            .expect("create task");
+        store
+            .transition_state("task-1", |mut state| {
+                state.phase = TaskPhase::Completed;
+                Ok::<_, TaskStoreError>(state)
+            })
+            .expect("complete task");
+
+        let result = loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.android.settings".to_string(),
+                    }),
+                    reason: "trying to reopen work".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                }),
+            })
+            .expect("step terminal task");
+
+        assert_eq!(
+            result.decision.next_action,
+            NextAction::StopTerminal {
+                phase: TaskPhase::Completed
+            }
+        );
+        assert!(result.task.state.current_action.is_none());
+    }
+
+    #[test]
+    fn accepted_model_action_is_marked_blocked_when_task_blocks_later() {
+        let (store, loop_runner) = test_loop();
+        store
+            .create(TaskState::new_background_task("task-1", "open settings"))
+            .expect("create task");
+        loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.android.settings".to_string(),
+                    }),
+                    reason: "open settings to inspect permissions".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                }),
+            })
+            .expect("accept action");
+
+        let result = loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![RuntimeObservation {
+                    source: RuntimeObservationSource::Cloud {
+                        provider: "test".to_string(),
+                    },
+                    event: RuntimeEvent::NetworkAvailabilityChanged { available: false },
+                }],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: None,
+            })
+            .expect("block later");
+
+        let action = result
+            .task
+            .state
+            .current_action
+            .as_ref()
+            .expect("current action");
+        assert_eq!(action.status, AgentActionStatus::Blocked);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Aborted);
+    }
+
+    #[test]
+    fn model_action_is_marked_blocked_when_same_step_requires_foreground() {
+        let (store, loop_runner) = test_loop();
+        store
+            .create(TaskState::new_background_task("task-1", "open settings"))
+            .expect("create task");
+
+        let result = loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![],
+                expected_foreground_package: Some("com.android.settings".to_string()),
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.android.settings".to_string(),
+                    }),
+                    reason: "open settings to inspect permissions".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                }),
+            })
+            .expect("block same step");
+
+        assert!(matches!(
+            result.decision.next_action,
+            NextAction::ReacquireForeground { .. }
+        ));
+        let action = result
+            .task
+            .state
+            .current_action
+            .as_ref()
+            .expect("current action");
+        assert_eq!(action.status, AgentActionStatus::Blocked);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Aborted);
+    }
+
+    #[test]
+    fn accepted_model_action_is_marked_observed_when_expected_foreground_matches() {
+        let (store, loop_runner) = test_loop();
+        store
+            .create(TaskState::new_background_task("task-1", "open settings"))
+            .expect("create task");
+        loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.android.settings".to_string(),
+                    }),
+                    reason: "open settings to inspect permissions".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                }),
+            })
+            .expect("accept action");
+
+        let result = loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![android_foreground("com.android.settings")],
+                expected_foreground_package: Some("com.android.settings".to_string()),
+                model_activity: None,
+                model_action: None,
+            })
+            .expect("observe foreground");
+
+        let action = result
+            .task
+            .state
+            .current_action
+            .as_ref()
+            .expect("current action");
+        assert_eq!(action.status, AgentActionStatus::Observed);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Committed);
+    }
+
+    #[test]
+    fn terminal_completed_task_marks_existing_action_verified() {
+        let (store, loop_runner) = test_loop();
+        store
+            .create(TaskState::new_background_task("task-1", "already done"))
+            .expect("create task");
+        loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::Observe,
+                    target: None,
+                    reason: "observe completion".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                }),
+            })
+            .expect("accept action");
+        store
+            .transition_state("task-1", |mut state| {
+                state.phase = TaskPhase::Completed;
+                Ok::<_, TaskStoreError>(state)
+            })
+            .expect("complete task");
+
+        let result = loop_runner
+            .step(LoopStepRequest::new("task-1"))
+            .expect("step terminal task");
+
+        let action = result
+            .task
+            .state
+            .current_action
+            .as_ref()
+            .expect("current action");
+        assert_eq!(action.status, AgentActionStatus::Verified);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Verified);
+    }
+
+    #[test]
+    fn terminal_failed_task_marks_existing_action_failed() {
+        let (store, loop_runner) = test_loop();
+        store
+            .create(TaskState::new_background_task("task-1", "failed task"))
+            .expect("create task");
+        loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::Observe,
+                    target: None,
+                    reason: "observe failure".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                }),
+            })
+            .expect("accept action");
+        store
+            .transition_state("task-1", |mut state| {
+                state.phase = TaskPhase::Failed;
+                Ok::<_, TaskStoreError>(state)
+            })
+            .expect("fail task");
+
+        let result = loop_runner
+            .step(LoopStepRequest::new("task-1"))
+            .expect("step terminal task");
+
+        let action = result
+            .task
+            .state
+            .current_action
+            .as_ref()
+            .expect("current action");
+        assert_eq!(action.status, AgentActionStatus::Failed);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Aborted);
     }
 
     #[test]
@@ -525,6 +897,7 @@ mod tests {
                 observations: vec![android_foreground("com.google.android.apps.nexuslauncher")],
                 expected_foreground_package: Some("com.android.settings".to_string()),
                 model_activity: None,
+                model_action: None,
             })
             .expect("step task");
 
@@ -570,6 +943,7 @@ mod tests {
                 observations: vec![],
                 expected_foreground_package: Some("com.android.settings".to_string()),
                 model_activity: None,
+                model_action: None,
             })
             .expect("step task");
 
@@ -606,6 +980,7 @@ mod tests {
                 observations: vec![],
                 expected_foreground_package: Some("com.android.settings".to_string()),
                 model_activity: None,
+                model_action: None,
             })
             .expect("step task");
 
@@ -642,6 +1017,7 @@ mod tests {
                 observations: vec![android_foreground("com.google.android.apps.nexuslauncher")],
                 expected_foreground_package: Some("com.android.settings".to_string()),
                 model_activity: None,
+                model_action: None,
             })
             .expect("block task");
 
@@ -651,6 +1027,7 @@ mod tests {
                 observations: vec![android_foreground("com.android.settings")],
                 expected_foreground_package: Some("com.android.settings".to_string()),
                 model_activity: None,
+                model_action: None,
             })
             .expect("unblock task");
 
@@ -689,6 +1066,7 @@ mod tests {
                 ],
                 expected_foreground_package: Some("com.android.settings".to_string()),
                 model_activity: None,
+                model_action: None,
             })
             .expect("step task");
 
@@ -715,6 +1093,7 @@ mod tests {
                 ],
                 expected_foreground_package: Some("com.android.settings".to_string()),
                 model_activity: None,
+                model_action: None,
             })
             .expect("step task");
 
@@ -750,6 +1129,7 @@ mod tests {
                 observations: vec![android_foreground("com.google.android.apps.nexuslauncher")],
                 expected_foreground_package: Some("com.android.settings".to_string()),
                 model_activity: None,
+                model_action: None,
             })
             .expect("step task");
 
@@ -783,6 +1163,7 @@ mod tests {
                 }],
                 expected_foreground_package: None,
                 model_activity: None,
+                model_action: None,
             })
             .expect("step task");
 
@@ -813,6 +1194,7 @@ mod tests {
                 }],
                 expected_foreground_package: None,
                 model_activity: None,
+                model_action: None,
             })
             .expect("block task");
 
@@ -827,6 +1209,7 @@ mod tests {
                 }],
                 expected_foreground_package: None,
                 model_activity: None,
+                model_action: None,
             })
             .expect("recover task");
 
@@ -873,6 +1256,7 @@ mod tests {
                 ],
                 expected_foreground_package: None,
                 model_activity: None,
+                model_action: None,
             })
             .expect("step task");
 

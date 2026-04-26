@@ -139,6 +139,83 @@ impl AgentActivity {
     }
 }
 
+/// A typed action the harness has accepted as the next concrete thing the
+/// agent is trying to do. This is separate from activity narration: activity
+/// explains current work, action intent defines the boundary to observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentActionKind {
+    Observe,
+    Navigate,
+    OpenApp,
+    Interact,
+    Read,
+    Write,
+    Communicate,
+    Execute,
+    Verify,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentActionStatus {
+    Accepted,
+    Executing,
+    Observed,
+    Verified,
+    Blocked,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAction {
+    pub kind: AgentActionKind,
+    pub target: Option<AgentActivityTarget>,
+    pub reason: String,
+    pub expected_observation: Option<String>,
+    pub status: AgentActionStatus,
+    pub boundary: ActionBoundary,
+    pub accepted_at_ms: u128,
+}
+
+impl AgentAction {
+    pub fn new(
+        kind: AgentActionKind,
+        target: Option<AgentActivityTarget>,
+        reason: impl Into<String>,
+        expected_observation: Option<String>,
+        boundary: ActionBoundary,
+    ) -> Result<Self, CheckpointClockError> {
+        Ok(Self::at(
+            kind,
+            target,
+            reason,
+            expected_observation,
+            AgentActionStatus::Accepted,
+            boundary,
+            now_ms()?,
+        ))
+    }
+
+    pub fn at(
+        kind: AgentActionKind,
+        target: Option<AgentActivityTarget>,
+        reason: impl Into<String>,
+        expected_observation: Option<String>,
+        status: AgentActionStatus,
+        boundary: ActionBoundary,
+        accepted_at_ms: u128,
+    ) -> Self {
+        Self {
+            kind,
+            target,
+            reason: reason.into(),
+            expected_observation,
+            status,
+            boundary,
+            accepted_at_ms,
+        }
+    }
+}
+
 /// Where an external action boundary sits relative to the outside world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActionBoundaryState {
