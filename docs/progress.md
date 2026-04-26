@@ -12,9 +12,10 @@ This list tracks the remaining gates before we can call the rooted Android proto
 - Android capability map exists as typed adapter data and docs.
 - Permission and safety boundary gates sensitive actions through typed grants.
 - Human handoff requests persist typed resume conditions and clear only from matching evidence.
+- Real task harness scores repeatable rooted-phone tasks by typed outcomes and observation evidence.
 
 ## Remaining
 
-1. Real task harness.
-   - Add a small repeatable rooted-phone task suite.
-   - Score each task by typed outcomes and observation evidence.
+- Runtime-owned Android app-control executor.
+  - Current harness proves action acceptance, executing state, and typed evidence closure.
+  - A future slice should make the runtime launch the app itself rather than using ADB setup.
