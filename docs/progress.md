@@ -10,17 +10,14 @@ This list tracks the remaining gates before we can call the rooted Android proto
 - Action execution can close through typed observation evidence.
 - Background runner ticks persisted tasks without broadcasting foreground evidence.
 - Android capability map exists as typed adapter data and docs.
+- Permission and safety boundary gates sensitive actions through typed grants.
 
 ## Remaining
 
-1. Permission and safety boundary.
-   - Add typed grants for sensitive actions: calling, messaging, app control, filesystem, network, notifications.
-   - Gate runtime actions through those grants.
-
-2. Human handoff contract.
+1. Human handoff contract.
    - When foreground/user help is needed, the task pauses with typed handoff state.
    - The task must resume from explicit evidence, not from prose.
 
-3. Real task harness.
+2. Real task harness.
    - Add a small repeatable rooted-phone task suite.
    - Score each task by typed outcomes and observation evidence.

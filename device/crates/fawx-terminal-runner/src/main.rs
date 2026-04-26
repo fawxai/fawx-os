@@ -17,7 +17,10 @@ use fawx_harness::{
     RuntimeObservationSource, TaskState, TaskTransitionError, apply_foreground_policy,
     begin_current_action_execution, record_action_checkpoint, require_foreground_attention,
 };
-use fawx_kernel::{ActionBoundary, ActionBoundaryState, AgentActionStatus, AgentActivityTarget};
+use fawx_kernel::{
+    ActionBoundary, ActionBoundaryState, AgentActionStatus, AgentActivityTarget, SafetyCapability,
+    SafetyGrant, SafetyScope,
+};
 use fawx_task_store::{StoredTask, TaskStore, default_task_store_path};
 
 fn main() -> ExitCode {
@@ -70,6 +73,19 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             let reason = joined_tail(&args, 2, "reason")?;
             let task =
                 store.transition_state(task_id, |state| foreground_block_state(reason, state))?;
+            print_task(&task)?;
+        }
+        "grant" => {
+            let task_id = required_arg(&args, 1, "task id")?;
+            let capability = parse_safety_capability(required_arg(&args, 2, "capability")?)?;
+            let scope = parse_safety_scope(required_arg(&args, 3, "scope")?)?;
+            let task = store.transition_state(task_id, |mut state| {
+                state
+                    .contract
+                    .safety_grants
+                    .push(SafetyGrant::scoped(capability, scope));
+                Ok::<_, TaskTransitionError>(state)
+            })?;
             print_task(&task)?;
         }
         "agent-step" => {
@@ -680,6 +696,46 @@ fn parse_action_kind(value: &str) -> Result<ModelActionKind, String> {
     }
 }
 
+fn parse_safety_capability(value: &str) -> Result<SafetyCapability, String> {
+    match value {
+        "app-control" => Ok(SafetyCapability::AppControl),
+        "calling" => Ok(SafetyCapability::Calling),
+        "messaging" => Ok(SafetyCapability::Messaging),
+        "filesystem-read" => Ok(SafetyCapability::FilesystemRead),
+        "filesystem-write" => Ok(SafetyCapability::FilesystemWrite),
+        "network" => Ok(SafetyCapability::Network),
+        "notifications-read" => Ok(SafetyCapability::NotificationsRead),
+        "notifications-post" => Ok(SafetyCapability::NotificationsPost),
+        "runtime-execution" => Ok(SafetyCapability::RuntimeExecution),
+        _ => Err(format!("unknown safety capability: {value}")),
+    }
+}
+
+fn parse_safety_scope(value: &str) -> Result<SafetyScope, String> {
+    if value == "any" {
+        return Ok(SafetyScope::Any);
+    }
+    if value == "network" {
+        return Ok(SafetyScope::Network);
+    }
+    if value == "notifications" {
+        return Ok(SafetyScope::NotificationSurface);
+    }
+    match parse_activity_target(value)? {
+        AgentActivityTarget::AndroidPackage { package_name } => {
+            Ok(SafetyScope::AndroidPackage { package_name })
+        }
+        AgentActivityTarget::Url { url } => Ok(SafetyScope::Url { url }),
+        AgentActivityTarget::File { path } => Ok(SafetyScope::File { path }),
+        AgentActivityTarget::Service { name } => Ok(SafetyScope::Service { name }),
+        AgentActivityTarget::Contact { label } => Ok(SafetyScope::Contact { label }),
+        AgentActivityTarget::RuntimeAction { name } => Ok(SafetyScope::RuntimeAction { name }),
+        AgentActivityTarget::Network => Ok(SafetyScope::Network),
+        AgentActivityTarget::Task => Ok(SafetyScope::Task),
+        AgentActivityTarget::Unknown => Err(format!("safety scope cannot use target: {value}")),
+    }
+}
+
 fn parse_activity_target(value: &str) -> Result<AgentActivityTarget, String> {
     if value == "task" {
         return Ok(AgentActivityTarget::Task);
@@ -726,6 +782,13 @@ fn print_usage() {
     eprintln!("  fawx-terminal-runner list");
     eprintln!("  fawx-terminal-runner checkpoint <task-id> <last-action-boundary>");
     eprintln!("  fawx-terminal-runner block-foreground <task-id> <reason>");
+    eprintln!("  fawx-terminal-runner grant <task-id> <capability> <scope>");
+    eprintln!(
+        "    capabilities: app-control|calling|messaging|filesystem-read|filesystem-write|network|notifications-read|notifications-post|runtime-execution"
+    );
+    eprintln!(
+        "    scopes: any|network|notifications|android-package:<id>|url:<url>|file:<path>|service:<name>|contact:<label>|runtime-action:<name>"
+    );
     eprintln!(
         "  fawx-terminal-runner agent-step <task-id> [--expected-foreground <package>] [--sample-foreground]"
     );
@@ -779,9 +842,14 @@ mod tests {
         package_name: &str,
         begin_execution: bool,
     ) {
-        store
-            .create(TaskState::new_background_task(task_id, "open app"))
-            .expect("create task");
+        let mut state = TaskState::new_background_task(task_id, "open app");
+        state.contract.safety_grants.push(SafetyGrant::scoped(
+            SafetyCapability::AppControl,
+            SafetyScope::AndroidPackage {
+                package_name: package_name.to_string(),
+            },
+        ));
+        store.create(state).expect("create task");
         AgentLoop::new(store.clone())
             .step(LoopStepRequest {
                 task_id: task_id.to_string(),
@@ -974,6 +1042,35 @@ mod tests {
             Some(AgentActivityTarget::AndroidPackage { package_name })
                 if package_name == "com.android.settings"
         ));
+    }
+
+    #[test]
+    fn safety_grant_parser_accepts_typed_package_scope() {
+        assert_eq!(
+            parse_safety_capability("app-control").expect("parse capability"),
+            SafetyCapability::AppControl
+        );
+        assert_eq!(
+            parse_safety_scope("android-package:com.android.settings").expect("parse scope"),
+            SafetyScope::AndroidPackage {
+                package_name: "com.android.settings".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn safety_grant_parser_accepts_task_scope() {
+        assert_eq!(
+            parse_safety_scope("task").expect("task is a runtime safety scope"),
+            SafetyScope::Task
+        );
+    }
+
+    #[test]
+    fn safety_grant_parser_rejects_unknown_scope() {
+        let error = parse_safety_scope("unknown").expect_err("unknown is not a safety scope");
+
+        assert!(error.contains("safety scope cannot use target"));
     }
 
     #[test]

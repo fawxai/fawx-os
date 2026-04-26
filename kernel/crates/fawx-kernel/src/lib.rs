@@ -25,12 +25,88 @@ pub struct CapabilityGrant {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SafetyCapability {
+    AppControl,
+    Calling,
+    Messaging,
+    FilesystemRead,
+    FilesystemWrite,
+    Network,
+    NotificationsRead,
+    NotificationsPost,
+    RuntimeExecution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SafetyScope {
+    Any,
+    AndroidPackage { package_name: String },
+    Contact { label: String },
+    File { path: String },
+    Network,
+    NotificationSurface,
+    RuntimeAction { name: String },
+    Service { name: String },
+    Task,
+    Url { url: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SafetyGrant {
+    pub capability: SafetyCapability,
+    pub scope: SafetyScope,
+}
+
+impl SafetyGrant {
+    pub fn any(capability: SafetyCapability) -> Self {
+        Self {
+            capability,
+            scope: SafetyScope::Any,
+        }
+    }
+
+    pub fn scoped(capability: SafetyCapability, scope: SafetyScope) -> Self {
+        Self { capability, scope }
+    }
+
+    pub fn allows(&self, requirement: &SafetyRequirement) -> bool {
+        self.capability == requirement.capability
+            && match (&self.scope, &requirement.scope) {
+                (SafetyScope::Any, _) => true,
+                (granted, required) => granted == required,
+            }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SafetyRequirement {
+    pub capability: SafetyCapability,
+    pub scope: SafetyScope,
+}
+
+impl SafetyRequirement {
+    pub fn new(capability: SafetyCapability, scope: SafetyScope) -> Self {
+        Self { capability, scope }
+    }
+}
+
 /// The smallest useful kernel contract: explicit authority plus explicit user
 /// intent. More detailed policy types will grow from this root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionContract {
     pub grants: Vec<CapabilityGrant>,
+    #[serde(default)]
+    pub safety_grants: Vec<SafetyGrant>,
     pub user_intent: String,
+}
+
+impl ExecutionContract {
+    pub fn allows(&self, requirement: &SafetyRequirement) -> bool {
+        self.safety_grants
+            .iter()
+            .any(|grant| grant.allows(requirement))
+    }
 }
 
 /// High-level execution phases for a long-lived task.

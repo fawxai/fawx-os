@@ -542,7 +542,7 @@ mod tests {
     };
     use fawx_kernel::{
         AgentActionKind, AgentActionStatus, AgentActivityKind, AgentActivitySource,
-        AgentActivityTarget,
+        AgentActivityTarget, SafetyCapability, SafetyGrant, SafetyScope,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -577,6 +577,17 @@ mod tests {
                 activity_name: None,
             },
         }
+    }
+
+    fn task_with_app_control(task_id: &str, objective: &str, package_name: &str) -> TaskState {
+        let mut state = TaskState::new_background_task(task_id, objective);
+        state.contract.safety_grants.push(SafetyGrant::scoped(
+            SafetyCapability::AppControl,
+            SafetyScope::AndroidPackage {
+                package_name: package_name.to_string(),
+            },
+        ));
+        state
     }
 
     #[test]
@@ -711,9 +722,10 @@ mod tests {
     fn background_runner_closes_task_scoped_foreground_action() {
         let (store, runner) = test_background_runner();
         store
-            .create(TaskState::new_background_task(
+            .create(task_with_app_control(
                 "task-open-launcher",
                 "open launcher",
+                "com.google.android.apps.nexuslauncher",
             ))
             .expect("create task");
         AgentLoop::new(store.clone())
@@ -766,9 +778,10 @@ mod tests {
     fn background_runner_does_not_apply_global_foreground_to_actions() {
         let (store, runner) = test_background_runner();
         store
-            .create(TaskState::new_background_task(
+            .create(task_with_app_control(
                 "task-open-launcher",
                 "open launcher",
+                "com.google.android.apps.nexuslauncher",
             ))
             .expect("create task");
         AgentLoop::new(store.clone())
@@ -811,9 +824,10 @@ mod tests {
     fn background_runner_does_not_close_or_block_accepted_action_from_foreground_sample() {
         let (store, runner) = test_background_runner();
         store
-            .create(TaskState::new_background_task(
+            .create(task_with_app_control(
                 "task-open-settings",
                 "open settings",
+                "com.android.settings",
             ))
             .expect("create task");
         AgentLoop::new(store.clone())
@@ -948,7 +962,11 @@ mod tests {
     fn model_action_proposal_is_accepted_on_unblocked_continue() {
         let (store, loop_runner) = test_loop();
         store
-            .create(TaskState::new_background_task("task-1", "open settings"))
+            .create(task_with_app_control(
+                "task-1",
+                "open settings",
+                "com.android.settings",
+            ))
             .expect("create task");
 
         let result = loop_runner
@@ -1157,7 +1175,11 @@ mod tests {
     fn accepted_model_action_is_marked_blocked_when_task_blocks_later() {
         let (store, loop_runner) = test_loop();
         store
-            .create(TaskState::new_background_task("task-1", "open settings"))
+            .create(task_with_app_control(
+                "task-1",
+                "open settings",
+                "com.android.settings",
+            ))
             .expect("create task");
         loop_runner
             .step(LoopStepRequest {
@@ -1209,7 +1231,11 @@ mod tests {
     fn model_action_is_marked_blocked_when_same_step_requires_foreground() {
         let (store, loop_runner) = test_loop();
         store
-            .create(TaskState::new_background_task("task-1", "open settings"))
+            .create(task_with_app_control(
+                "task-1",
+                "open settings",
+                "com.android.settings",
+            ))
             .expect("create task");
 
         let result = loop_runner
@@ -1248,7 +1274,11 @@ mod tests {
     fn accepted_model_action_is_marked_observed_when_expected_foreground_matches() {
         let (store, loop_runner) = test_loop();
         store
-            .create(TaskState::new_background_task("task-1", "open settings"))
+            .create(task_with_app_control(
+                "task-1",
+                "open settings",
+                "com.android.settings",
+            ))
             .expect("create task");
         loop_runner
             .step(LoopStepRequest {
@@ -1295,7 +1325,11 @@ mod tests {
     fn open_model_action_cannot_be_overwritten_before_observation_reduces() {
         let (store, loop_runner) = test_loop();
         store
-            .create(TaskState::new_background_task("task-1", "open settings"))
+            .create(task_with_app_control(
+                "task-1",
+                "open settings",
+                "com.android.settings",
+            ))
             .expect("create task");
         loop_runner
             .step(LoopStepRequest {

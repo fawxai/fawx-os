@@ -7,8 +7,8 @@ pub use fawx_kernel::TaskPhase;
 use fawx_kernel::{
     ActionBoundary, ActionBoundaryState, AgentAction, AgentActionEvidence, AgentActionKind,
     AgentActionObservation, AgentActionStatus, AgentActivity, AgentActivityKind,
-    AgentActivitySource, AgentActivityTarget, AttentionRequirement, ExecutionContract, TaskBlocker,
-    TaskCheckpoint,
+    AgentActivitySource, AgentActivityTarget, AttentionRequirement, ExecutionContract,
+    SafetyCapability, SafetyRequirement, SafetyScope, TaskBlocker, TaskCheckpoint,
 };
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -107,6 +107,7 @@ impl TaskState {
             attention_requirement: AttentionRequirement::BackgroundAllowed,
             contract: ExecutionContract {
                 grants: vec![],
+                safety_grants: vec![],
                 user_intent: objective,
             },
             checkpoint: None,
@@ -398,6 +399,24 @@ pub fn accept_model_action_proposal(
             reason,
         }
     })?;
+    for requirement in
+        safety_requirements_for_action(&proposal.kind, &proposal.target).map_err(|reason| {
+            TaskTransitionError::InvalidAction {
+                task_id: state.task_id.clone(),
+                reason,
+            }
+        })?
+    {
+        if !state.contract.allows(&requirement) {
+            return Err(TaskTransitionError::InvalidAction {
+                task_id: state.task_id.clone(),
+                reason: format!(
+                    "missing safety grant {:?} for target {:?}",
+                    requirement.capability, requirement.scope
+                ),
+            });
+        }
+    }
     let expected_observation = proposal
         .expected_observation
         .map(|value| value.trim().to_string())
@@ -574,6 +593,96 @@ fn validate_action_target(
     valid
         .then_some(())
         .ok_or_else(|| format!("action kind {kind:?} requires a compatible typed target"))
+}
+
+fn safety_requirements_for_action(
+    kind: &ModelActionKind,
+    target: &Option<AgentActivityTarget>,
+) -> Result<Vec<SafetyRequirement>, String> {
+    let requirements = match (kind, target) {
+        (ModelActionKind::Observe | ModelActionKind::Verify, _) => vec![],
+        (ModelActionKind::OpenApp, Some(AgentActivityTarget::AndroidPackage { package_name }))
+        | (ModelActionKind::Interact, Some(AgentActivityTarget::AndroidPackage { package_name })) =>
+        {
+            vec![SafetyRequirement::new(
+                SafetyCapability::AppControl,
+                SafetyScope::AndroidPackage {
+                    package_name: package_name.clone(),
+                },
+            )]
+        }
+        (ModelActionKind::Navigate, Some(AgentActivityTarget::Url { url }))
+        | (ModelActionKind::Read, Some(AgentActivityTarget::Url { url }))
+        | (ModelActionKind::Write, Some(AgentActivityTarget::Url { url }))
+        | (ModelActionKind::Interact, Some(AgentActivityTarget::Url { url })) => {
+            vec![SafetyRequirement::new(
+                SafetyCapability::Network,
+                SafetyScope::Url { url: url.clone() },
+            )]
+        }
+        (ModelActionKind::Read, Some(AgentActivityTarget::File { path })) => {
+            vec![SafetyRequirement::new(
+                SafetyCapability::FilesystemRead,
+                SafetyScope::File { path: path.clone() },
+            )]
+        }
+        (ModelActionKind::Write, Some(AgentActivityTarget::File { path }))
+        | (ModelActionKind::Interact, Some(AgentActivityTarget::File { path })) => {
+            vec![SafetyRequirement::new(
+                SafetyCapability::FilesystemWrite,
+                SafetyScope::File { path: path.clone() },
+            )]
+        }
+        (ModelActionKind::Communicate, Some(AgentActivityTarget::Contact { label }))
+        | (ModelActionKind::Interact, Some(AgentActivityTarget::Contact { label })) => {
+            vec![SafetyRequirement::new(
+                SafetyCapability::Messaging,
+                SafetyScope::Contact {
+                    label: label.clone(),
+                },
+            )]
+        }
+        (ModelActionKind::Read, Some(AgentActivityTarget::Service { name }))
+        | (ModelActionKind::Write, Some(AgentActivityTarget::Service { name }))
+        | (ModelActionKind::Interact, Some(AgentActivityTarget::Service { name }))
+        | (ModelActionKind::Communicate, Some(AgentActivityTarget::Service { name })) => {
+            vec![SafetyRequirement::new(
+                SafetyCapability::Network,
+                SafetyScope::Service { name: name.clone() },
+            )]
+        }
+        (ModelActionKind::Interact, Some(AgentActivityTarget::Network)) => {
+            vec![SafetyRequirement::new(
+                SafetyCapability::Network,
+                SafetyScope::Network,
+            )]
+        }
+        (ModelActionKind::Interact, Some(AgentActivityTarget::Task)) => {
+            vec![SafetyRequirement::new(
+                SafetyCapability::RuntimeExecution,
+                SafetyScope::Task,
+            )]
+        }
+        (ModelActionKind::Execute, Some(AgentActivityTarget::Service { name })) => {
+            vec![SafetyRequirement::new(
+                SafetyCapability::Network,
+                SafetyScope::Service { name: name.clone() },
+            )]
+        }
+        (ModelActionKind::Execute, Some(AgentActivityTarget::RuntimeAction { name }))
+        | (ModelActionKind::Interact, Some(AgentActivityTarget::RuntimeAction { name })) => {
+            vec![SafetyRequirement::new(
+                SafetyCapability::RuntimeExecution,
+                SafetyScope::RuntimeAction { name: name.clone() },
+            )]
+        }
+        _ => {
+            return Err(format!(
+                "action kind {kind:?} has no safety contract for target {target:?}"
+            ));
+        }
+    };
+    Ok(requirements)
 }
 
 pub fn record_current_blocker_activity(state: TaskState) -> Result<TaskState, TaskTransitionError> {
@@ -983,8 +1092,23 @@ mod tests {
     use super::*;
     use fawx_kernel::{
         ActionBoundaryState, AgentActionEvidence, AgentActionStatus, CapabilityGrant,
-        CapabilitySurface,
+        CapabilitySurface, SafetyGrant,
     };
+
+    fn task_with_app_control(task_id: &str, objective: &str, package_name: &str) -> TaskState {
+        let mut state = TaskState::new_background_task(task_id, objective);
+        grant_app_control(&mut state, package_name);
+        state
+    }
+
+    fn grant_app_control(state: &mut TaskState, package_name: &str) {
+        state.contract.safety_grants.push(SafetyGrant::scoped(
+            SafetyCapability::AppControl,
+            SafetyScope::AndroidPackage {
+                package_name: package_name.to_string(),
+            },
+        ));
+    }
 
     fn foreground_observation(package_name: &str) -> RuntimeObservation {
         RuntimeObservation {
@@ -1010,6 +1134,7 @@ mod tests {
                     surface: CapabilitySurface::Browser,
                     name: "navigate".to_string(),
                 }],
+                safety_grants: vec![],
                 user_intent: "cancel that subscription".to_string(),
             },
             checkpoint: Some(TaskCheckpoint::at(
@@ -1049,6 +1174,7 @@ mod tests {
             attention_requirement: AttentionRequirement::ForegroundRequired,
             contract: ExecutionContract {
                 grants: vec![],
+                safety_grants: vec![],
                 user_intent: "finish checkout".to_string(),
             },
             checkpoint: None,
@@ -1158,7 +1284,7 @@ mod tests {
 
     #[test]
     fn model_action_proposal_records_accepted_action_boundary() {
-        let state = TaskState::new_background_task("task-1", "open settings");
+        let state = task_with_app_control("task-1", "open settings", "com.android.settings");
 
         let state = accept_model_action_proposal(
             state,
@@ -1252,6 +1378,247 @@ mod tests {
     }
 
     #[test]
+    fn model_action_proposal_rejects_open_app_without_app_control_grant() {
+        let state = TaskState::new_background_task("task-1", "open settings");
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                reason: "open settings".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("open app must require app-control authority");
+
+        assert!(
+            matches!(error, TaskTransitionError::InvalidAction { reason, .. } if reason.contains("missing safety grant AppControl"))
+        );
+    }
+
+    #[test]
+    fn app_control_grant_does_not_authorize_other_package() {
+        let state = task_with_app_control("task-1", "open launcher", "com.android.settings");
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.google.android.apps.nexuslauncher".to_string(),
+                }),
+                reason: "open launcher".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("package-scoped grant must not authorize a different app");
+
+        assert!(
+            matches!(error, TaskTransitionError::InvalidAction { reason, .. } if reason.contains("missing safety grant AppControl"))
+        );
+    }
+
+    #[test]
+    fn filesystem_read_grant_does_not_authorize_write() {
+        let mut state = TaskState::new_background_task("task-1", "edit a file");
+        state.contract.safety_grants.push(SafetyGrant::scoped(
+            SafetyCapability::FilesystemRead,
+            SafetyScope::File {
+                path: "/tmp/note.txt".to_string(),
+            },
+        ));
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::Write,
+                target: Some(AgentActivityTarget::File {
+                    path: "/tmp/note.txt".to_string(),
+                }),
+                reason: "write the note".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("read authority must not authorize writes");
+
+        assert!(
+            matches!(error, TaskTransitionError::InvalidAction { reason, .. } if reason.contains("missing safety grant FilesystemWrite"))
+        );
+    }
+
+    #[test]
+    fn network_grant_required_for_navigation() {
+        let mut state = TaskState::new_background_task("task-1", "open docs");
+        state.contract.safety_grants.push(SafetyGrant::scoped(
+            SafetyCapability::Network,
+            SafetyScope::Url {
+                url: "https://example.com".to_string(),
+            },
+        ));
+
+        let state = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::Navigate,
+                target: Some(AgentActivityTarget::Url {
+                    url: "https://example.com".to_string(),
+                }),
+                reason: "open the docs".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect("matching network url grant should authorize navigation");
+
+        assert_eq!(
+            state.current_action.as_ref().map(|action| action.kind),
+            Some(AgentActionKind::Navigate)
+        );
+    }
+
+    #[test]
+    fn messaging_requires_contact_grant() {
+        let state = TaskState::new_background_task("task-1", "message Alex");
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::Communicate,
+                target: Some(AgentActivityTarget::Contact {
+                    label: "Alex".to_string(),
+                }),
+                reason: "send Alex a message".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("contact communication must require messaging authority");
+
+        assert!(
+            matches!(error, TaskTransitionError::InvalidAction { reason, .. } if reason.contains("missing safety grant Messaging"))
+        );
+    }
+
+    #[test]
+    fn service_reads_require_network_service_grant() {
+        let state = TaskState::new_background_task("task-1", "read service");
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::Read,
+                target: Some(AgentActivityTarget::Service {
+                    name: "calendar".to_string(),
+                }),
+                reason: "read the calendar service".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("service reads must require network service authority");
+
+        assert!(
+            matches!(error, TaskTransitionError::InvalidAction { reason, .. } if reason.contains("missing safety grant Network"))
+        );
+    }
+
+    #[test]
+    fn interact_url_requires_network_url_grant() {
+        let state = TaskState::new_background_task("task-1", "click docs");
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::Interact,
+                target: Some(AgentActivityTarget::Url {
+                    url: "https://example.com".to_string(),
+                }),
+                reason: "click on the page".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("url interaction must require network url authority");
+
+        assert!(
+            matches!(error, TaskTransitionError::InvalidAction { reason, .. } if reason.contains("missing safety grant Network"))
+        );
+    }
+
+    #[test]
+    fn interact_file_requires_filesystem_write_grant() {
+        let state = TaskState::new_background_task("task-1", "edit file");
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::Interact,
+                target: Some(AgentActivityTarget::File {
+                    path: "/tmp/note.txt".to_string(),
+                }),
+                reason: "edit the file".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("file interaction must require write authority");
+
+        assert!(
+            matches!(error, TaskTransitionError::InvalidAction { reason, .. } if reason.contains("missing safety grant FilesystemWrite"))
+        );
+    }
+
+    #[test]
+    fn interact_contact_requires_messaging_grant() {
+        let state = TaskState::new_background_task("task-1", "message Alex");
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::Interact,
+                target: Some(AgentActivityTarget::Contact {
+                    label: "Alex".to_string(),
+                }),
+                reason: "interact with Alex".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("contact interaction must require messaging authority");
+
+        assert!(
+            matches!(error, TaskTransitionError::InvalidAction { reason, .. } if reason.contains("missing safety grant Messaging"))
+        );
+    }
+
+    #[test]
+    fn interact_task_requires_runtime_execution_grant() {
+        let state = TaskState::new_background_task("task-1", "approve task");
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::Interact,
+                target: Some(AgentActivityTarget::Task),
+                reason: "interact with the task runtime".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("task interaction must require runtime execution authority");
+
+        assert!(
+            matches!(error, TaskTransitionError::InvalidAction { reason, .. } if reason.contains("missing safety grant RuntimeExecution"))
+        );
+    }
+
+    #[test]
     fn model_action_proposal_generates_distinct_boundary_ids() {
         let state = TaskState::new_background_task("task-1", "open settings");
         let mut state = accept_model_action_proposal(
@@ -1301,7 +1668,7 @@ mod tests {
     #[test]
     fn model_action_proposal_rejects_replacing_open_current_action() {
         let state = accept_model_action_proposal(
-            TaskState::new_background_task("task-1", "open settings"),
+            task_with_app_control("task-1", "open settings", "com.android.settings"),
             ModelActionProposal {
                 kind: ModelActionKind::OpenApp,
                 target: Some(AgentActivityTarget::AndroidPackage {
@@ -1333,9 +1700,12 @@ mod tests {
 
     #[test]
     fn model_action_proposal_allows_new_action_after_observation_closes_previous() {
+        let mut initial_state =
+            task_with_app_control("task-1", "open settings", "com.android.settings");
+        grant_app_control(&mut initial_state, "com.google.android.apps.nexuslauncher");
         let state = begin_current_action_execution(
             accept_model_action_proposal(
-                TaskState::new_background_task("task-1", "open settings"),
+                initial_state,
                 ModelActionProposal {
                     kind: ModelActionKind::OpenApp,
                     target: Some(AgentActivityTarget::AndroidPackage {
@@ -1417,7 +1787,7 @@ mod tests {
     #[test]
     fn begin_current_action_execution_marks_boundary_prepared() {
         let state = accept_model_action_proposal(
-            TaskState::new_background_task("task-1", "open settings"),
+            task_with_app_control("task-1", "open settings", "com.android.settings"),
             ModelActionProposal {
                 kind: ModelActionKind::OpenApp,
                 target: Some(AgentActivityTarget::AndroidPackage {
@@ -1442,7 +1812,7 @@ mod tests {
     fn observe_current_action_records_matching_foreground_evidence() {
         let state = begin_current_action_execution(
             accept_model_action_proposal(
-                TaskState::new_background_task("task-1", "open settings"),
+                task_with_app_control("task-1", "open settings", "com.android.settings"),
                 ModelActionProposal {
                     kind: ModelActionKind::OpenApp,
                     target: Some(AgentActivityTarget::AndroidPackage {
@@ -1474,7 +1844,7 @@ mod tests {
     #[test]
     fn observe_current_action_does_not_skip_execution() {
         let state = accept_model_action_proposal(
-            TaskState::new_background_task("task-1", "open settings"),
+            task_with_app_control("task-1", "open settings", "com.android.settings"),
             ModelActionProposal {
                 kind: ModelActionKind::OpenApp,
                 target: Some(AgentActivityTarget::AndroidPackage {
@@ -1501,7 +1871,7 @@ mod tests {
     fn observe_current_action_does_not_close_mismatched_foreground() {
         let state = begin_current_action_execution(
             accept_model_action_proposal(
-                TaskState::new_background_task("task-1", "open settings"),
+                task_with_app_control("task-1", "open settings", "com.android.settings"),
                 ModelActionProposal {
                     kind: ModelActionKind::OpenApp,
                     target: Some(AgentActivityTarget::AndroidPackage {
@@ -1530,7 +1900,7 @@ mod tests {
     fn begin_current_action_execution_does_not_reopen_observed_action() {
         let state = begin_current_action_execution(
             accept_model_action_proposal(
-                TaskState::new_background_task("task-1", "open settings"),
+                task_with_app_control("task-1", "open settings", "com.android.settings"),
                 ModelActionProposal {
                     kind: ModelActionKind::OpenApp,
                     target: Some(AgentActivityTarget::AndroidPackage {
@@ -1556,7 +1926,7 @@ mod tests {
     #[test]
     fn begin_current_action_execution_rejects_closed_boundary_even_if_status_is_accepted() {
         let mut state = accept_model_action_proposal(
-            TaskState::new_background_task("task-1", "open settings"),
+            task_with_app_control("task-1", "open settings", "com.android.settings"),
             ModelActionProposal {
                 kind: ModelActionKind::OpenApp,
                 target: Some(AgentActivityTarget::AndroidPackage {
