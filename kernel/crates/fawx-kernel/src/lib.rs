@@ -170,6 +170,75 @@ pub enum AgentActivityTarget {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HumanHandoffKind {
+    Foreground,
+    UserApproval,
+    UserInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HumanHandoffResumeCondition {
+    ForegroundPackage { package_name: String },
+    ExplicitUserApproval,
+    ExplicitUserInput,
+    Manual,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HumanHandoffEvidence {
+    pub handoff_id: String,
+    pub condition: HumanHandoffResumeCondition,
+    pub summary: String,
+    pub observed_at_ms: u128,
+}
+
+impl HumanHandoffEvidence {
+    pub fn new(
+        handoff_id: impl Into<String>,
+        condition: HumanHandoffResumeCondition,
+        summary: impl Into<String>,
+    ) -> Result<Self, CheckpointClockError> {
+        Ok(Self {
+            handoff_id: handoff_id.into(),
+            condition,
+            summary: summary.into(),
+            observed_at_ms: now_ms()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HumanHandoffRequest {
+    pub id: String,
+    pub kind: HumanHandoffKind,
+    pub reason: String,
+    pub target: Option<AgentActivityTarget>,
+    pub resume_condition: HumanHandoffResumeCondition,
+    pub requested_at_ms: u128,
+    pub last_evidence: Option<HumanHandoffEvidence>,
+}
+
+impl HumanHandoffRequest {
+    pub fn new(
+        id: impl Into<String>,
+        kind: HumanHandoffKind,
+        reason: impl Into<String>,
+        target: Option<AgentActivityTarget>,
+        resume_condition: HumanHandoffResumeCondition,
+    ) -> Result<Self, CheckpointClockError> {
+        Ok(Self {
+            id: id.into(),
+            kind,
+            reason: reason.into(),
+            target,
+            resume_condition,
+            requested_at_ms: now_ms()?,
+            last_evidence: None,
+        })
+    }
+}
+
 /// Where an activity description came from. This lets future renderers treat
 /// model-declared intent differently from tool-derived or system-derived state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

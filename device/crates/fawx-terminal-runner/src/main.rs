@@ -16,6 +16,7 @@ use fawx_harness::{
     ModelActivityKind, ModelActivityProposal, RuntimeEvent, RuntimeObservation,
     RuntimeObservationSource, TaskState, TaskTransitionError, apply_foreground_policy,
     begin_current_action_execution, record_action_checkpoint, require_foreground_attention,
+    satisfy_human_handoff,
 };
 use fawx_kernel::{
     ActionBoundary, ActionBoundaryState, AgentActionStatus, AgentActivityTarget, SafetyCapability,
@@ -73,6 +74,15 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             let reason = joined_tail(&args, 2, "reason")?;
             let task =
                 store.transition_state(task_id, |state| foreground_block_state(reason, state))?;
+            print_task(&task)?;
+        }
+        "complete-handoff" => {
+            let task_id = required_arg(&args, 1, "task id")?;
+            let handoff_id = required_arg(&args, 2, "handoff id")?.to_string();
+            let summary = joined_tail(&args, 3, "handoff summary")?;
+            let task = store.transition_state(task_id, |state| {
+                satisfy_human_handoff(state, handoff_completion_observation(handoff_id, summary))
+            })?;
             print_task(&task)?;
         }
         "grant" => {
@@ -621,6 +631,18 @@ fn runtime_observation_from_android(observation: &AndroidObservation) -> Runtime
     }
 }
 
+fn handoff_completion_observation(handoff_id: String, summary: String) -> RuntimeObservation {
+    RuntimeObservation {
+        source: RuntimeObservationSource::Shell {
+            name: "fawx-terminal-runner".to_string(),
+        },
+        event: RuntimeEvent::HumanHandoffCompleted {
+            handoff_id,
+            summary,
+        },
+    }
+}
+
 fn print_task(task: &StoredTask) -> Result<(), Box<dyn Error>> {
     println!("{}", serde_json::to_string_pretty(task)?);
     Ok(())
@@ -782,6 +804,7 @@ fn print_usage() {
     eprintln!("  fawx-terminal-runner list");
     eprintln!("  fawx-terminal-runner checkpoint <task-id> <last-action-boundary>");
     eprintln!("  fawx-terminal-runner block-foreground <task-id> <reason>");
+    eprintln!("  fawx-terminal-runner complete-handoff <task-id> <handoff-id> <summary>");
     eprintln!("  fawx-terminal-runner grant <task-id> <capability> <scope>");
     eprintln!(
         "    capabilities: app-control|calling|messaging|filesystem-read|filesystem-write|network|notifications-read|notifications-post|runtime-execution"
@@ -1071,6 +1094,24 @@ mod tests {
         let error = parse_safety_scope("unknown").expect_err("unknown is not a safety scope");
 
         assert!(error.contains("safety scope cannot use target"));
+    }
+
+    #[test]
+    fn handoff_completion_observation_is_typed_runtime_evidence() {
+        let observation = handoff_completion_observation(
+            "handoff:task-1:user-approval".to_string(),
+            "approved".to_string(),
+        );
+
+        assert!(matches!(
+            observation.source,
+            RuntimeObservationSource::Shell { ref name } if name == "fawx-terminal-runner"
+        ));
+        assert!(matches!(
+            observation.event,
+            RuntimeEvent::HumanHandoffCompleted { handoff_id, summary }
+                if handoff_id == "handoff:task-1:user-approval" && summary == "approved"
+        ));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use fawx_harness::{
     apply_foreground_policy, clear_agent_activity, record_action_checkpoint,
     record_current_blocker_activity, record_model_declared_activity, record_planning_activity,
     require_external_condition, require_foreground_attention_for_package,
-    satisfy_external_condition,
+    satisfy_external_condition, satisfy_human_handoff,
 };
 use fawx_kernel::{
     ActionBoundary, ActionBoundaryState, AgentActionStatus, AgentActivityTarget, TaskBlocker,
@@ -466,6 +466,9 @@ fn reduce_non_foreground_observation(
         RuntimeEvent::RuntimeActionFailed { action, reason } => {
             let reason = format!("runtime action {action} failed: {reason}");
             require_external_condition(state, reason, Some(observation.clone()))
+        }
+        RuntimeEvent::HumanHandoffCompleted { .. } => {
+            satisfy_human_handoff(state, observation.clone())
         }
         _ => {
             let mut state = state;

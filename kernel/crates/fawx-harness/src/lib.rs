@@ -8,6 +8,7 @@ use fawx_kernel::{
     ActionBoundary, ActionBoundaryState, AgentAction, AgentActionEvidence, AgentActionKind,
     AgentActionObservation, AgentActionStatus, AgentActivity, AgentActivityKind,
     AgentActivitySource, AgentActivityTarget, AttentionRequirement, ExecutionContract,
+    HumanHandoffEvidence, HumanHandoffKind, HumanHandoffRequest, HumanHandoffResumeCondition,
     SafetyCapability, SafetyRequirement, SafetyScope, TaskBlocker, TaskCheckpoint,
 };
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,10 @@ pub enum RuntimeEvent {
         action: String,
         reason: String,
     },
+    HumanHandoffCompleted {
+        handoff_id: String,
+        summary: String,
+    },
 }
 
 /// A typed runtime observation with explicit source provenance.
@@ -93,6 +98,10 @@ pub struct TaskState {
     pub action_sequence: u64,
     #[serde(default)]
     pub last_runtime_observation: Option<RuntimeObservation>,
+    #[serde(default)]
+    pub current_handoff: Option<HumanHandoffRequest>,
+    #[serde(default)]
+    pub completed_handoffs: Vec<HumanHandoffEvidence>,
 }
 
 impl TaskState {
@@ -116,6 +125,8 @@ impl TaskState {
             current_action: None,
             action_sequence: 0,
             last_runtime_observation: None,
+            current_handoff: None,
+            completed_handoffs: vec![],
         }
     }
 
@@ -311,6 +322,14 @@ pub fn satisfy_external_condition(
 ) -> Result<TaskState, TaskTransitionError> {
     ensure_not_terminal(&state)?;
     external_condition_satisfied(state, observation)
+}
+
+pub fn satisfy_human_handoff(
+    state: TaskState,
+    observation: RuntimeObservation,
+) -> Result<TaskState, TaskTransitionError> {
+    ensure_not_terminal(&state)?;
+    human_handoff_satisfied(state, observation)
 }
 
 pub fn record_planning_activity(
@@ -813,6 +832,13 @@ fn foreground_available(
         Some(TaskBlocker::WaitingForForeground { .. }) | None => None,
         Some(blocker) => Some(blocker),
     };
+    if was_waiting_for_foreground
+        && let Some(evidence) =
+            clear_matching_foreground_handoff(state.current_handoff.as_ref(), &action_observation)?
+    {
+        state.completed_handoffs.push(evidence);
+        state.current_handoff = None;
+    }
     state.blocker = blocker.clone();
     state.last_runtime_observation = Some(observation);
 
@@ -858,12 +884,100 @@ fn foreground_required(
         state.phase = TaskPhase::Waiting;
         state.mode = ExecutionMode::ForegroundAssisted;
         state.attention_requirement = AttentionRequirement::ForegroundRequired;
+        let next_handoff = foreground_handoff_request(&state.task_id, reason, target.clone())?;
+        state.current_handoff = Some(preserve_matching_handoff(
+            state.current_handoff.take(),
+            next_handoff,
+        ));
     }
 
     state.blocker = blocker.clone();
     state.last_runtime_observation = observation;
     state.current_activity = blocker_activity_with_target(&blocker, target)?;
     mark_current_action(state, AgentActionStatus::Blocked)
+}
+
+fn foreground_handoff_request(
+    task_id: &str,
+    reason: &str,
+    target: Option<AgentActivityTarget>,
+) -> Result<HumanHandoffRequest, TaskTransitionError> {
+    let resume_condition = match &target {
+        Some(AgentActivityTarget::AndroidPackage { package_name }) => {
+            HumanHandoffResumeCondition::ForegroundPackage {
+                package_name: package_name.clone(),
+            }
+        }
+        _ => HumanHandoffResumeCondition::Manual,
+    };
+    HumanHandoffRequest::new(
+        handoff_id_for(task_id, &resume_condition),
+        HumanHandoffKind::Foreground,
+        reason,
+        target,
+        resume_condition,
+    )
+    .map_err(|_| TaskTransitionError::CheckpointClock)
+}
+
+fn clear_matching_foreground_handoff(
+    handoff: Option<&HumanHandoffRequest>,
+    observation: &RuntimeObservation,
+) -> Result<Option<HumanHandoffEvidence>, TaskTransitionError> {
+    let Some(handoff) = handoff else {
+        return Ok(None);
+    };
+    let RuntimeEvent::ForegroundAppChanged { package_name, .. } = &observation.event else {
+        return Ok(None);
+    };
+    let HumanHandoffResumeCondition::ForegroundPackage {
+        package_name: expected,
+    } = &handoff.resume_condition
+    else {
+        return Ok(None);
+    };
+    if expected != package_name {
+        return Ok(None);
+    }
+    Ok(Some(
+        HumanHandoffEvidence::new(
+            handoff.id.clone(),
+            handoff.resume_condition.clone(),
+            format!("foreground package {package_name} observed"),
+        )
+        .map_err(|_| TaskTransitionError::CheckpointClock)?,
+    ))
+}
+
+fn preserve_matching_handoff(
+    existing: Option<HumanHandoffRequest>,
+    next: HumanHandoffRequest,
+) -> HumanHandoffRequest {
+    match existing {
+        Some(existing)
+            if existing.kind == next.kind
+                && existing.target == next.target
+                && existing.resume_condition == next.resume_condition =>
+        {
+            existing
+        }
+        _ => next,
+    }
+}
+
+fn handoff_id_for(task_id: &str, condition: &HumanHandoffResumeCondition) -> String {
+    match condition {
+        HumanHandoffResumeCondition::ForegroundPackage { package_name } => {
+            format!("handoff:{task_id}:foreground:{package_name}")
+        }
+        HumanHandoffResumeCondition::ExplicitUserApproval => {
+            format!("handoff:{task_id}:user-approval")
+        }
+        HumanHandoffResumeCondition::ExplicitUserInput => {
+            format!("handoff:{task_id}:user-input")
+        }
+        HumanHandoffResumeCondition::Manual => format!("handoff:{task_id}:manual"),
+    }
 }
 
 fn external_condition_satisfied(
@@ -929,6 +1043,143 @@ fn external_condition_required(
     state.last_runtime_observation = observation;
     state.current_activity = blocker_activity(&blocker)?;
     mark_current_action(state, AgentActionStatus::Blocked)
+}
+
+fn human_handoff_satisfied(
+    mut state: TaskState,
+    observation: RuntimeObservation,
+) -> Result<TaskState, TaskTransitionError> {
+    let RuntimeEvent::HumanHandoffCompleted {
+        handoff_id,
+        summary,
+    } = &observation.event
+    else {
+        state.last_runtime_observation = Some(observation);
+        return Ok(state);
+    };
+    let handoff_id = handoff_id.clone();
+    let summary = summary.clone();
+    ensure_legacy_handoff_for_completion(&mut state, &handoff_id)?;
+    let Some(handoff) = state.current_handoff.take() else {
+        state.last_runtime_observation = Some(observation);
+        return Ok(state);
+    };
+    if handoff.id != handoff_id {
+        state.current_handoff = Some(handoff);
+        state.last_runtime_observation = Some(observation);
+        return Ok(state);
+    }
+
+    if matches!(
+        handoff.resume_condition,
+        HumanHandoffResumeCondition::ForegroundPackage { .. }
+    ) {
+        state.current_handoff = Some(handoff);
+        state.last_runtime_observation = Some(observation);
+        return Ok(state);
+    }
+
+    let action_observation = observation.clone();
+    state.last_runtime_observation = Some(observation);
+    let (blocker, cleared_matching_blocker) =
+        clear_blocker_matching_resume_condition(state.blocker.take(), &handoff.resume_condition);
+    state.blocker = blocker;
+    if cleared_matching_blocker {
+        let evidence = HumanHandoffEvidence::new(
+            handoff_id.clone(),
+            handoff.resume_condition.clone(),
+            &summary,
+        )
+        .map_err(|_| TaskTransitionError::CheckpointClock)?;
+        state.completed_handoffs.push(evidence);
+        state.phase = if state.checkpoint.is_some() {
+            TaskPhase::Checkpointed
+        } else {
+            TaskPhase::Running
+        };
+        state.mode = ExecutionMode::BackgroundCapable;
+        state.attention_requirement = AttentionRequirement::BackgroundAllowed;
+        state.current_activity = Some(system_activity(
+            AgentActivityKind::Observing,
+            handoff.target,
+            "human handoff evidence accepted",
+        )?);
+        state = observe_current_action(state, &action_observation)?;
+    } else {
+        state.current_handoff = Some(handoff);
+        state.current_activity = blocker_activity(&state.blocker)?;
+        state = mark_current_action(state, AgentActionStatus::Blocked)?;
+    }
+    Ok(state)
+}
+
+fn ensure_legacy_handoff_for_completion(
+    state: &mut TaskState,
+    handoff_id: &str,
+) -> Result<(), TaskTransitionError> {
+    if state
+        .current_handoff
+        .as_ref()
+        .is_some_and(|handoff| handoff.id == handoff_id)
+    {
+        return Ok(());
+    }
+    let Some((kind, condition, reason)) = legacy_user_handoff_contract(&state.blocker) else {
+        return Ok(());
+    };
+    let candidate_id = handoff_id_for(&state.task_id, &condition);
+    if candidate_id != handoff_id {
+        return Ok(());
+    }
+    state.current_handoff = Some(
+        HumanHandoffRequest::new(
+            candidate_id,
+            kind,
+            reason,
+            Some(AgentActivityTarget::Task),
+            condition,
+        )
+        .map_err(|_| TaskTransitionError::CheckpointClock)?,
+    );
+    Ok(())
+}
+
+fn clear_blocker_matching_resume_condition(
+    blocker: Option<TaskBlocker>,
+    condition: &HumanHandoffResumeCondition,
+) -> (Option<TaskBlocker>, bool) {
+    match (&blocker, condition) {
+        (
+            Some(TaskBlocker::WaitingForUserApproval { .. }),
+            HumanHandoffResumeCondition::ExplicitUserApproval,
+        )
+        | (
+            Some(TaskBlocker::WaitingForUserInput { .. }),
+            HumanHandoffResumeCondition::ExplicitUserInput,
+        )
+        | (Some(TaskBlocker::WaitingForForeground { .. }), HumanHandoffResumeCondition::Manual) => {
+            (None, true)
+        }
+        _ => (blocker, false),
+    }
+}
+
+fn legacy_user_handoff_contract(
+    blocker: &Option<TaskBlocker>,
+) -> Option<(HumanHandoffKind, HumanHandoffResumeCondition, String)> {
+    match blocker {
+        Some(TaskBlocker::WaitingForUserApproval { reason }) => Some((
+            HumanHandoffKind::UserApproval,
+            HumanHandoffResumeCondition::ExplicitUserApproval,
+            reason.clone(),
+        )),
+        Some(TaskBlocker::WaitingForUserInput { reason }) => Some((
+            HumanHandoffKind::UserInput,
+            HumanHandoffResumeCondition::ExplicitUserInput,
+            reason.clone(),
+        )),
+        _ => None,
+    }
 }
 
 fn ensure_not_terminal(state: &TaskState) -> Result<(), TaskTransitionError> {
@@ -1007,6 +1258,14 @@ fn action_evidence_for_observation(
                 reason: reason.clone(),
             })
         }
+        RuntimeEvent::HumanHandoffCompleted {
+            handoff_id,
+            summary,
+        } if action_accepts_handoff_completion(action, handoff_id) => {
+            Some(AgentActionEvidence::Manual {
+                summary: summary.clone(),
+            })
+        }
         _ => None,
     }
 }
@@ -1043,6 +1302,16 @@ fn action_accepts_runtime_failure(action: &AgentAction, failed_action: &str) -> 
             AgentActionKind::Execute,
             Some(AgentActivityTarget::RuntimeAction { name })
         ) if name == failed_action
+    )
+}
+
+fn action_accepts_handoff_completion(action: &AgentAction, handoff_id: &str) -> bool {
+    matches!(
+        (&action.kind, &action.target),
+        (
+            AgentActionKind::Interact | AgentActionKind::Verify,
+            Some(AgentActivityTarget::Task)
+        ) if action.boundary.id == handoff_id
     )
 }
 
@@ -1158,6 +1427,8 @@ mod tests {
             current_action: None,
             action_sequence: 0,
             last_runtime_observation: None,
+            current_handoff: None,
+            completed_handoffs: vec![],
         };
 
         assert_eq!(state.mode, ExecutionMode::BackgroundCapable);
@@ -1185,6 +1456,8 @@ mod tests {
             current_action: None,
             action_sequence: 0,
             last_runtime_observation: None,
+            current_handoff: None,
+            completed_handoffs: vec![],
         };
 
         assert_eq!(
@@ -1218,6 +1491,8 @@ mod tests {
         assert_eq!(state.task_id, "task-1");
         assert!(state.current_activity.is_none());
         assert!(state.current_action.is_none());
+        assert!(state.current_handoff.is_none());
+        assert!(state.completed_handoffs.is_empty());
         assert_eq!(state.action_sequence, 0);
     }
 
@@ -2137,6 +2412,508 @@ mod tests {
         assert_eq!(state.checkpoint, original_checkpoint);
         assert_eq!(state.last_runtime_observation, Some(observation));
         assert!(state.blocker.is_none());
+    }
+
+    #[test]
+    fn foreground_requirement_creates_typed_handoff() {
+        let state = require_foreground_attention_for_package(
+            TaskState::new_background_task("task-1", "inspect settings"),
+            "com.android.settings",
+            "settings must be foreground",
+        )
+        .expect("require foreground");
+
+        let handoff = state.current_handoff.expect("handoff");
+        assert_eq!(handoff.kind, HumanHandoffKind::Foreground);
+        assert_eq!(handoff.id, "handoff:task-1:foreground:com.android.settings");
+        assert!(matches!(
+            handoff.resume_condition,
+            HumanHandoffResumeCondition::ForegroundPackage { package_name }
+                if package_name == "com.android.settings"
+        ));
+        assert!(matches!(
+            handoff.target,
+            Some(AgentActivityTarget::AndroidPackage { package_name })
+                if package_name == "com.android.settings"
+        ));
+    }
+
+    #[test]
+    fn foreground_handoff_clears_only_from_matching_observation() {
+        let state = require_foreground_attention_for_package(
+            TaskState::new_background_task("task-1", "inspect settings"),
+            "com.android.settings",
+            "settings must be foreground",
+        )
+        .expect("require foreground");
+        let observation = foreground_observation("com.android.settings");
+
+        let (state, decision) =
+            apply_foreground_policy(state, &observation, "com.android.settings")
+                .expect("foreground transition");
+
+        assert!(matches!(
+            decision,
+            ForegroundPolicyDecision::ContinueInBackground { .. }
+        ));
+        assert!(state.current_handoff.is_none());
+        assert_eq!(state.completed_handoffs.len(), 1);
+        assert_eq!(
+            state.completed_handoffs[0].handoff_id,
+            "handoff:task-1:foreground:com.android.settings"
+        );
+        assert!(state.blocker.is_none());
+        assert_eq!(state.phase, TaskPhase::Running);
+    }
+
+    #[test]
+    fn stale_foreground_handoff_does_not_record_evidence_without_active_blocker() {
+        let mut state = TaskState::new_background_task("task-1", "already resumed");
+        state.current_handoff = Some(
+            HumanHandoffRequest::new(
+                "handoff:task-1:foreground:com.android.settings",
+                HumanHandoffKind::Foreground,
+                "settings must be foreground",
+                Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                HumanHandoffResumeCondition::ForegroundPackage {
+                    package_name: "com.android.settings".to_string(),
+                },
+            )
+            .expect("handoff"),
+        );
+        let observation = foreground_observation("com.android.settings");
+
+        let (state, decision) =
+            apply_foreground_policy(state, &observation, "com.android.settings")
+                .expect("foreground transition");
+
+        assert!(matches!(
+            decision,
+            ForegroundPolicyDecision::ContinueInBackground { .. }
+        ));
+        assert!(state.current_handoff.is_some());
+        assert!(state.completed_handoffs.is_empty());
+        assert!(state.blocker.is_none());
+        assert_eq!(state.phase, TaskPhase::Running);
+    }
+
+    #[test]
+    fn stale_foreground_handoff_does_not_record_evidence_with_unrelated_blocker() {
+        let mut state = TaskState::new_background_task("task-1", "enter account number");
+        state.phase = TaskPhase::Waiting;
+        state.blocker = Some(TaskBlocker::WaitingForUserInput {
+            reason: "need account number".to_string(),
+        });
+        state.current_handoff = Some(
+            HumanHandoffRequest::new(
+                "handoff:task-1:foreground:com.android.settings",
+                HumanHandoffKind::Foreground,
+                "settings must be foreground",
+                Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                HumanHandoffResumeCondition::ForegroundPackage {
+                    package_name: "com.android.settings".to_string(),
+                },
+            )
+            .expect("handoff"),
+        );
+        let observation = foreground_observation("com.android.settings");
+
+        let (state, decision) =
+            apply_foreground_policy(state, &observation, "com.android.settings")
+                .expect("foreground transition");
+
+        assert!(matches!(
+            decision,
+            ForegroundPolicyDecision::ContinueInBackground { .. }
+        ));
+        assert!(state.current_handoff.is_some());
+        assert!(state.completed_handoffs.is_empty());
+        assert!(matches!(
+            state.blocker,
+            Some(TaskBlocker::WaitingForUserInput { .. })
+        ));
+        assert_eq!(state.phase, TaskPhase::Waiting);
+    }
+
+    #[test]
+    fn mismatched_foreground_preserves_handoff() {
+        let state = require_foreground_attention_for_package(
+            TaskState::new_background_task("task-1", "inspect settings"),
+            "com.android.settings",
+            "settings must be foreground",
+        )
+        .expect("require foreground");
+        let observation = foreground_observation("com.android.settings.other");
+
+        let (state, decision) =
+            apply_foreground_policy(state, &observation, "com.android.settings")
+                .expect("foreground transition");
+
+        assert!(matches!(
+            decision,
+            ForegroundPolicyDecision::RequireForeground { .. }
+        ));
+        assert!(state.current_handoff.is_some());
+        assert!(matches!(
+            state.blocker,
+            Some(TaskBlocker::WaitingForForeground { .. })
+        ));
+    }
+
+    #[test]
+    fn foreground_handoff_identity_survives_repeated_mismatch() {
+        let state = require_foreground_attention_for_package(
+            TaskState::new_background_task("task-1", "inspect settings"),
+            "com.android.settings",
+            "settings must be foreground",
+        )
+        .expect("require foreground");
+        let requested_at_ms = state
+            .current_handoff
+            .as_ref()
+            .expect("handoff")
+            .requested_at_ms;
+        let observation = foreground_observation("com.android.settings.other");
+
+        let (state, _) = apply_foreground_policy(state, &observation, "com.android.settings")
+            .expect("foreground transition");
+
+        assert_eq!(
+            state
+                .current_handoff
+                .as_ref()
+                .expect("handoff")
+                .requested_at_ms,
+            requested_at_ms
+        );
+    }
+
+    #[test]
+    fn foreground_handoff_cannot_be_completed_by_manual_event() {
+        let state = require_foreground_attention_for_package(
+            TaskState::new_background_task("task-1", "inspect settings"),
+            "com.android.settings",
+            "settings must be foreground",
+        )
+        .expect("require foreground");
+        let observation = RuntimeObservation {
+            source: RuntimeObservationSource::Shell {
+                name: "test".to_string(),
+            },
+            event: RuntimeEvent::HumanHandoffCompleted {
+                handoff_id: "handoff:task-1:foreground:com.android.settings".to_string(),
+                summary: "done".to_string(),
+            },
+        };
+
+        let state = satisfy_human_handoff(state, observation).expect("ignore foreground shortcut");
+
+        assert!(state.current_handoff.is_some());
+        assert!(state.completed_handoffs.is_empty());
+        assert!(matches!(
+            state.blocker,
+            Some(TaskBlocker::WaitingForForeground { .. })
+        ));
+        assert_eq!(state.phase, TaskPhase::Waiting);
+    }
+
+    #[test]
+    fn explicit_handoff_completion_clears_user_approval_blocker() {
+        let mut state = TaskState::new_background_task("task-1", "approve checkout");
+        state.phase = TaskPhase::Waiting;
+        state.blocker = Some(TaskBlocker::WaitingForUserApproval {
+            reason: "approve checkout".to_string(),
+        });
+        state.current_handoff = Some(
+            HumanHandoffRequest::new(
+                "handoff:task-1:user-approval",
+                HumanHandoffKind::UserApproval,
+                "approve checkout",
+                Some(AgentActivityTarget::Task),
+                HumanHandoffResumeCondition::ExplicitUserApproval,
+            )
+            .expect("handoff"),
+        );
+        let observation = RuntimeObservation {
+            source: RuntimeObservationSource::Shell {
+                name: "test".to_string(),
+            },
+            event: RuntimeEvent::HumanHandoffCompleted {
+                handoff_id: "handoff:task-1:user-approval".to_string(),
+                summary: "approved".to_string(),
+            },
+        };
+
+        let state = satisfy_human_handoff(state, observation.clone()).expect("satisfy handoff");
+
+        assert!(state.current_handoff.is_none());
+        assert_eq!(state.completed_handoffs.len(), 1);
+        assert_eq!(
+            state.completed_handoffs[0].handoff_id,
+            "handoff:task-1:user-approval"
+        );
+        assert!(state.blocker.is_none());
+        assert_eq!(state.phase, TaskPhase::Running);
+        assert_eq!(state.last_runtime_observation, Some(observation));
+    }
+
+    #[test]
+    fn legacy_user_approval_blocker_gets_typed_handoff_on_completion() {
+        let mut state = TaskState::new_background_task("task-1", "approve checkout");
+        state.phase = TaskPhase::Waiting;
+        state.blocker = Some(TaskBlocker::WaitingForUserApproval {
+            reason: "approve checkout".to_string(),
+        });
+        let observation = RuntimeObservation {
+            source: RuntimeObservationSource::Shell {
+                name: "test".to_string(),
+            },
+            event: RuntimeEvent::HumanHandoffCompleted {
+                handoff_id: "handoff:task-1:user-approval".to_string(),
+                summary: "approved".to_string(),
+            },
+        };
+
+        let state =
+            satisfy_human_handoff(state, observation).expect("satisfy legacy handoff blocker");
+
+        assert!(state.current_handoff.is_none());
+        assert!(state.blocker.is_none());
+        assert_eq!(state.completed_handoffs.len(), 1);
+    }
+
+    #[test]
+    fn wrong_handoff_completion_does_not_resume_task() {
+        let mut state = TaskState::new_background_task("task-1", "approve checkout");
+        state.phase = TaskPhase::Waiting;
+        state.blocker = Some(TaskBlocker::WaitingForUserApproval {
+            reason: "approve checkout".to_string(),
+        });
+        state.current_handoff = Some(
+            HumanHandoffRequest::new(
+                "handoff:task-1:user-approval",
+                HumanHandoffKind::UserApproval,
+                "approve checkout",
+                Some(AgentActivityTarget::Task),
+                HumanHandoffResumeCondition::ExplicitUserApproval,
+            )
+            .expect("handoff"),
+        );
+        let observation = RuntimeObservation {
+            source: RuntimeObservationSource::Shell {
+                name: "test".to_string(),
+            },
+            event: RuntimeEvent::HumanHandoffCompleted {
+                handoff_id: "handoff:task-1:other".to_string(),
+                summary: "approved".to_string(),
+            },
+        };
+
+        let state = satisfy_human_handoff(state, observation).expect("ignore wrong handoff");
+
+        assert!(state.current_handoff.is_some());
+        assert!(matches!(
+            state.blocker,
+            Some(TaskBlocker::WaitingForUserApproval { .. })
+        ));
+        assert_eq!(state.phase, TaskPhase::Waiting);
+    }
+
+    #[test]
+    fn stale_handoff_completion_does_not_clear_mismatched_blocker() {
+        let mut state = TaskState::new_background_task("task-1", "approve checkout");
+        state.phase = TaskPhase::Waiting;
+        state.blocker = Some(TaskBlocker::WaitingForUserInput {
+            reason: "need account number".to_string(),
+        });
+        state.current_handoff = Some(
+            HumanHandoffRequest::new(
+                "handoff:task-1:user-approval",
+                HumanHandoffKind::UserApproval,
+                "approve checkout",
+                Some(AgentActivityTarget::Task),
+                HumanHandoffResumeCondition::ExplicitUserApproval,
+            )
+            .expect("handoff"),
+        );
+        let observation = RuntimeObservation {
+            source: RuntimeObservationSource::Shell {
+                name: "test".to_string(),
+            },
+            event: RuntimeEvent::HumanHandoffCompleted {
+                handoff_id: "handoff:task-1:user-approval".to_string(),
+                summary: "approved".to_string(),
+            },
+        };
+
+        let state = satisfy_human_handoff(state, observation).expect("stale completion");
+
+        assert!(state.current_handoff.is_some());
+        assert!(state.completed_handoffs.is_empty());
+        assert!(matches!(
+            state.blocker,
+            Some(TaskBlocker::WaitingForUserInput { .. })
+        ));
+        assert_eq!(state.phase, TaskPhase::Waiting);
+    }
+
+    #[test]
+    fn correct_legacy_handoff_completion_replaces_stale_handoff() {
+        let mut state = TaskState::new_background_task("task-1", "enter account number");
+        state.phase = TaskPhase::Waiting;
+        state.blocker = Some(TaskBlocker::WaitingForUserInput {
+            reason: "need account number".to_string(),
+        });
+        state.current_handoff = Some(
+            HumanHandoffRequest::new(
+                "handoff:task-1:user-approval",
+                HumanHandoffKind::UserApproval,
+                "stale approval",
+                Some(AgentActivityTarget::Task),
+                HumanHandoffResumeCondition::ExplicitUserApproval,
+            )
+            .expect("handoff"),
+        );
+        let observation = RuntimeObservation {
+            source: RuntimeObservationSource::Shell {
+                name: "test".to_string(),
+            },
+            event: RuntimeEvent::HumanHandoffCompleted {
+                handoff_id: "handoff:task-1:user-input".to_string(),
+                summary: "entered account number".to_string(),
+            },
+        };
+
+        let state =
+            satisfy_human_handoff(state, observation).expect("replace stale handoff from blocker");
+
+        assert!(state.current_handoff.is_none());
+        assert!(state.blocker.is_none());
+        assert_eq!(state.phase, TaskPhase::Running);
+        assert_eq!(state.completed_handoffs.len(), 1);
+        assert_eq!(
+            state.completed_handoffs[0].handoff_id,
+            "handoff:task-1:user-input"
+        );
+    }
+
+    #[test]
+    fn stale_user_handoff_completion_does_not_clear_foreground_blocker() {
+        let mut state = TaskState::new_background_task("task-1", "open settings");
+        state.phase = TaskPhase::Waiting;
+        state.blocker = Some(TaskBlocker::WaitingForForeground {
+            reason: "settings must be foreground".to_string(),
+        });
+        state.current_handoff = Some(
+            HumanHandoffRequest::new(
+                "handoff:task-1:user-approval",
+                HumanHandoffKind::UserApproval,
+                "approve settings action",
+                Some(AgentActivityTarget::Task),
+                HumanHandoffResumeCondition::ExplicitUserApproval,
+            )
+            .expect("handoff"),
+        );
+        let observation = RuntimeObservation {
+            source: RuntimeObservationSource::Shell {
+                name: "test".to_string(),
+            },
+            event: RuntimeEvent::HumanHandoffCompleted {
+                handoff_id: "handoff:task-1:user-approval".to_string(),
+                summary: "approved".to_string(),
+            },
+        };
+
+        let state = satisfy_human_handoff(state, observation).expect("stale completion");
+
+        assert!(state.current_handoff.is_some());
+        assert!(state.completed_handoffs.is_empty());
+        assert!(matches!(
+            state.blocker,
+            Some(TaskBlocker::WaitingForForeground { .. })
+        ));
+        assert_eq!(state.phase, TaskPhase::Waiting);
+    }
+
+    #[test]
+    fn manual_foreground_handoff_completion_clears_generic_foreground_blocker() {
+        let mut state = TaskState::new_background_task("task-1", "bring app forward");
+        state.phase = TaskPhase::Waiting;
+        state.mode = ExecutionMode::ForegroundAssisted;
+        state.attention_requirement = AttentionRequirement::ForegroundRequired;
+        state.blocker = Some(TaskBlocker::WaitingForForeground {
+            reason: "needs foreground help".to_string(),
+        });
+        state.current_handoff = Some(
+            HumanHandoffRequest::new(
+                "handoff:task-1:manual",
+                HumanHandoffKind::Foreground,
+                "needs foreground help",
+                None,
+                HumanHandoffResumeCondition::Manual,
+            )
+            .expect("handoff"),
+        );
+        let observation = RuntimeObservation {
+            source: RuntimeObservationSource::Shell {
+                name: "test".to_string(),
+            },
+            event: RuntimeEvent::HumanHandoffCompleted {
+                handoff_id: "handoff:task-1:manual".to_string(),
+                summary: "user brought the app forward".to_string(),
+            },
+        };
+
+        let state = satisfy_human_handoff(state, observation).expect("complete manual handoff");
+
+        assert!(state.current_handoff.is_none());
+        assert!(state.blocker.is_none());
+        assert_eq!(state.phase, TaskPhase::Running);
+        assert_eq!(state.mode, ExecutionMode::BackgroundCapable);
+        assert_eq!(
+            state.attention_requirement,
+            AttentionRequirement::BackgroundAllowed
+        );
+        assert_eq!(state.completed_handoffs.len(), 1);
+        assert_eq!(
+            state.completed_handoffs[0].handoff_id,
+            "handoff:task-1:manual"
+        );
+    }
+
+    #[test]
+    fn stale_handoff_completion_does_not_record_evidence_without_active_blocker() {
+        let mut state = TaskState::new_background_task("task-1", "already resumed");
+        state.current_handoff = Some(
+            HumanHandoffRequest::new(
+                "handoff:task-1:manual",
+                HumanHandoffKind::Foreground,
+                "stale foreground handoff",
+                None,
+                HumanHandoffResumeCondition::Manual,
+            )
+            .expect("handoff"),
+        );
+        let observation = RuntimeObservation {
+            source: RuntimeObservationSource::Shell {
+                name: "test".to_string(),
+            },
+            event: RuntimeEvent::HumanHandoffCompleted {
+                handoff_id: "handoff:task-1:manual".to_string(),
+                summary: "late completion".to_string(),
+            },
+        };
+
+        let state = satisfy_human_handoff(state, observation).expect("ignore stale completion");
+
+        assert!(state.current_handoff.is_some());
+        assert!(state.blocker.is_none());
+        assert!(state.completed_handoffs.is_empty());
+        assert_eq!(state.phase, TaskPhase::Running);
     }
 
     #[test]
