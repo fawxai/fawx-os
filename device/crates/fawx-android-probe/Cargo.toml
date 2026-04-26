@@ -1,0 +1,17 @@
+[package]
+name = "fawx-android-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fawx-android-adapter = { path = "../fawx-android-adapter" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "fawx-android-probe"
+path = "src/main.rs"

@@ -1,0 +1,19 @@
+[package]
+name = "fawx-terminal-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fawx-android-adapter = { path = "../fawx-android-adapter" }
+fawx-harness = { path = "../../../kernel/crates/fawx-harness" }
+fawx-kernel = { path = "../../../kernel/crates/fawx-kernel" }
+fawx-task-store = { path = "../../../kernel/crates/fawx-task-store" }
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "fawx-terminal-runner"
+path = "src/main.rs"
