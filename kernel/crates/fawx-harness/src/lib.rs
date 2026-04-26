@@ -128,6 +128,10 @@ pub enum TaskTransitionError {
         blocker: TaskBlocker,
     },
     CheckpointClock,
+    InvalidActivity {
+        task_id: String,
+        reason: String,
+    },
 }
 
 impl Display for TaskTransitionError {
@@ -140,11 +144,46 @@ impl Display for TaskTransitionError {
                 write!(f, "task {task_id} is blocked by {blocker:?}")
             }
             Self::CheckpointClock => write!(f, "could not timestamp checkpoint"),
+            Self::InvalidActivity { task_id, reason } => {
+                write!(f, "task {task_id} rejected activity: {reason}")
+            }
         }
     }
 }
 
 impl Error for TaskTransitionError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelActivityProposal {
+    pub kind: ModelActivityKind,
+    pub target: Option<AgentActivityTarget>,
+    pub description: String,
+}
+
+/// Activity kinds the model is allowed to declare directly.
+///
+/// Waiting is intentionally absent: waiting is derived from typed blockers so
+/// the control plane can keep ownership of paused/blocked state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelActivityKind {
+    Observing,
+    Planning,
+    Executing,
+    Verifying,
+    Summarizing,
+}
+
+impl From<ModelActivityKind> for AgentActivityKind {
+    fn from(kind: ModelActivityKind) -> Self {
+        match kind {
+            ModelActivityKind::Observing => Self::Observing,
+            ModelActivityKind::Planning => Self::Planning,
+            ModelActivityKind::Executing => Self::Executing,
+            ModelActivityKind::Verifying => Self::Verifying,
+            ModelActivityKind::Summarizing => Self::Summarizing,
+        }
+    }
+}
 
 pub fn record_action_checkpoint(
     state: TaskState,
@@ -230,6 +269,38 @@ pub fn record_planning_activity(
         Some(AgentActivityTarget::Task),
         description,
     )?);
+    Ok(state)
+}
+
+pub fn record_model_declared_activity(
+    state: TaskState,
+    proposal: ModelActivityProposal,
+) -> Result<TaskState, TaskTransitionError> {
+    ensure_not_terminal(&state)?;
+    if let Some(blocker) = state.blocker.clone() {
+        return Err(TaskTransitionError::BlockedTask {
+            task_id: state.task_id,
+            blocker,
+        });
+    }
+    let description = proposal.description.trim();
+    if description.is_empty() {
+        return Err(TaskTransitionError::InvalidActivity {
+            task_id: state.task_id,
+            reason: "activity description must not be empty".to_string(),
+        });
+    }
+
+    let mut state = state;
+    state.current_activity = Some(
+        AgentActivity::new(
+            proposal.kind.into(),
+            proposal.target,
+            description,
+            AgentActivitySource::ModelDeclared,
+        )
+        .map_err(|_| TaskTransitionError::CheckpointClock)?,
+    );
     Ok(state)
 }
 
@@ -625,6 +696,67 @@ mod tests {
 
         assert_eq!(state.task_id, "task-1");
         assert!(state.current_activity.is_none());
+    }
+
+    #[test]
+    fn model_declared_activity_records_source_and_target_when_unblocked() {
+        let state = TaskState::new_background_task("task-1", "inspect settings");
+
+        let state = record_model_declared_activity(
+            state,
+            ModelActivityProposal {
+                kind: ModelActivityKind::Observing,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                description: "checking settings state".to_string(),
+            },
+        )
+        .expect("record model activity");
+
+        let activity = state.current_activity.expect("activity");
+        assert_eq!(activity.kind, AgentActivityKind::Observing);
+        assert_eq!(activity.source, AgentActivitySource::ModelDeclared);
+        assert!(matches!(
+            activity.target,
+            Some(AgentActivityTarget::AndroidPackage { package_name })
+                if package_name == "com.android.settings"
+        ));
+        assert_eq!(activity.description, "checking settings state");
+    }
+
+    #[test]
+    fn model_declared_activity_rejects_blocked_tasks() {
+        let mut state = TaskState::new_background_task("task-1", "approve checkout");
+        state.blocker = Some(TaskBlocker::WaitingForUserApproval {
+            reason: "approve checkout".to_string(),
+        });
+
+        let error = record_model_declared_activity(
+            state,
+            ModelActivityProposal {
+                kind: ModelActivityKind::Planning,
+                target: Some(AgentActivityTarget::Task),
+                description: "planning checkout".to_string(),
+            },
+        )
+        .expect_err("blocked model activity should reject");
+
+        assert!(matches!(error, TaskTransitionError::BlockedTask { .. }));
+    }
+
+    #[test]
+    fn model_activity_proposal_schema_rejects_waiting_kind() {
+        let payload = r#"{
+          "kind": "Waiting",
+          "target": "Task",
+          "description": "waiting on something"
+        }"#;
+
+        let error = serde_json::from_str::<ModelActivityProposal>(payload)
+            .expect_err("waiting must not be in the model-declared schema");
+
+        assert!(error.to_string().contains("unknown variant"));
     }
 
     #[test]
