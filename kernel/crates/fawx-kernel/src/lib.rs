@@ -166,6 +166,50 @@ pub enum AgentActionStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentActionEvidence {
+    ForegroundPackage {
+        package_name: String,
+        activity_name: Option<String>,
+    },
+    NetworkAvailable,
+    RuntimeActionFailed {
+        action: String,
+        reason: String,
+    },
+    Manual {
+        summary: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentActionObservation {
+    pub action_id: String,
+    pub evidence: AgentActionEvidence,
+    pub observed_at_ms: u128,
+}
+
+impl AgentActionObservation {
+    pub fn new(
+        action_id: impl Into<String>,
+        evidence: AgentActionEvidence,
+    ) -> Result<Self, CheckpointClockError> {
+        Ok(Self::at(action_id, evidence, now_ms()?))
+    }
+
+    pub fn at(
+        action_id: impl Into<String>,
+        evidence: AgentActionEvidence,
+        observed_at_ms: u128,
+    ) -> Self {
+        Self {
+            action_id: action_id.into(),
+            evidence,
+            observed_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentAction {
     pub kind: AgentActionKind,
     pub target: Option<AgentActivityTarget>,
@@ -174,6 +218,8 @@ pub struct AgentAction {
     pub status: AgentActionStatus,
     pub boundary: ActionBoundary,
     pub accepted_at_ms: u128,
+    #[serde(default)]
+    pub last_observation: Option<AgentActionObservation>,
 }
 
 impl AgentAction {
@@ -184,15 +230,16 @@ impl AgentAction {
         expected_observation: Option<String>,
         boundary: ActionBoundary,
     ) -> Result<Self, CheckpointClockError> {
-        Ok(Self::at(
+        Ok(Self {
             kind,
             target,
-            reason,
+            reason: reason.into(),
             expected_observation,
-            AgentActionStatus::Accepted,
+            status: AgentActionStatus::Accepted,
             boundary,
-            now_ms()?,
-        ))
+            accepted_at_ms: now_ms()?,
+            last_observation: None,
+        })
     }
 
     pub fn at(
@@ -212,6 +259,7 @@ impl AgentAction {
             status,
             boundary,
             accepted_at_ms,
+            last_observation: None,
         }
     }
 }

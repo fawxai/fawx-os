@@ -13,7 +13,7 @@ use fawx_harness::{
     ForegroundPolicyDecision, ForegroundUnavailableReason, ModelActionKind, ModelActionProposal,
     ModelActivityKind, ModelActivityProposal, RuntimeEvent, RuntimeObservation,
     RuntimeObservationSource, TaskState, TaskTransitionError, apply_foreground_policy,
-    record_action_checkpoint, require_foreground_attention,
+    begin_current_action_execution, record_action_checkpoint, require_foreground_attention,
 };
 use fawx_kernel::{ActionBoundary, ActionBoundaryState, AgentActivityTarget};
 use fawx_task_store::{StoredTask, TaskStore, default_task_store_path};
@@ -74,6 +74,11 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             let task_id = required_arg(&args, 1, "task id")?;
             let options = AgentStepOptions::parse(&args[2..])?;
             run_agent_step(&store, task_id, options)?;
+        }
+        "begin-action" => {
+            let task_id = required_arg(&args, 1, "task id")?;
+            let task = store.transition_state(task_id, begin_current_action_execution)?;
+            print_task(&task)?;
         }
         "heartbeat" => {
             let task_id = required_arg(&args, 1, "task id")?;
@@ -574,6 +579,7 @@ fn print_usage() {
     );
     eprintln!("    [--action-reason <reason>] [--action-target <target>]");
     eprintln!("    [--expected-observation <observation>]");
+    eprintln!("  fawx-terminal-runner begin-action <task-id>");
     eprintln!("  fawx-terminal-runner heartbeat <task-id> [count] [interval-ms] [--foreground]");
     eprintln!(
         "  fawx-terminal-runner watch-foreground <task-id> <expected-package> [count] [interval-ms]"

@@ -336,7 +336,10 @@ fn maybe_accept_model_action(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fawx_harness::{ModelActionKind, ModelActivityKind, RuntimeObservationSource, TaskState};
+    use fawx_harness::{
+        ModelActionKind, ModelActivityKind, RuntimeObservationSource, TaskState,
+        begin_current_action_execution,
+    };
     use fawx_kernel::{
         AgentActionKind, AgentActionStatus, AgentActivityKind, AgentActivitySource,
         AgentActivityTarget,
@@ -691,6 +694,9 @@ mod tests {
                 }),
             })
             .expect("accept action");
+        store
+            .transition_state("task-1", begin_current_action_execution)
+            .expect("begin action");
 
         let result = loop_runner
             .step(LoopStepRequest {
@@ -779,6 +785,9 @@ mod tests {
                 }),
             })
             .expect("accept action");
+        store
+            .transition_state("task-1", begin_current_action_execution)
+            .expect("begin action");
 
         let result = loop_runner
             .step(LoopStepRequest {
@@ -798,6 +807,57 @@ mod tests {
             .expect("current action");
         assert_eq!(action.status, AgentActionStatus::Observed);
         assert_eq!(action.boundary.state, ActionBoundaryState::Committed);
+    }
+
+    #[test]
+    fn open_model_action_cannot_be_overwritten_before_observation_reduces() {
+        let (store, loop_runner) = test_loop();
+        store
+            .create(TaskState::new_background_task("task-1", "open settings"))
+            .expect("create task");
+        loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.android.settings".to_string(),
+                    }),
+                    reason: "open settings".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                }),
+            })
+            .expect("accept first action");
+        store
+            .transition_state("task-1", begin_current_action_execution)
+            .expect("begin first action");
+
+        let error = loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![android_foreground("com.android.settings")],
+                expected_foreground_package: Some("com.android.settings".to_string()),
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.google.android.apps.nexuslauncher".to_string(),
+                    }),
+                    reason: "replace with launcher".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                }),
+            })
+            .expect_err("open action must not be overwritten before evidence reduces");
+
+        assert!(matches!(
+            error,
+            AgentLoopError::Transition(TaskTransitionError::InvalidAction { .. })
+        ));
     }
 
     #[test]

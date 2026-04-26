@@ -5,9 +5,10 @@
 
 pub use fawx_kernel::TaskPhase;
 use fawx_kernel::{
-    ActionBoundary, ActionBoundaryState, AgentAction, AgentActionKind, AgentActionStatus,
-    AgentActivity, AgentActivityKind, AgentActivitySource, AgentActivityTarget,
-    AttentionRequirement, ExecutionContract, TaskBlocker, TaskCheckpoint,
+    ActionBoundary, ActionBoundaryState, AgentAction, AgentActionEvidence, AgentActionKind,
+    AgentActionObservation, AgentActionStatus, AgentActivity, AgentActivityKind,
+    AgentActivitySource, AgentActivityTarget, AttentionRequirement, ExecutionContract, TaskBlocker,
+    TaskCheckpoint,
 };
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -381,6 +382,16 @@ pub fn accept_model_action_proposal(
             reason: "action reason must not be empty".to_string(),
         });
     }
+    if state
+        .current_action
+        .as_ref()
+        .is_some_and(current_action_is_open)
+    {
+        return Err(TaskTransitionError::InvalidAction {
+            task_id: state.task_id,
+            reason: "cannot accept a new action while the current action is still open".to_string(),
+        });
+    }
     validate_action_target(&proposal.kind, &proposal.target).map_err(|reason| {
         TaskTransitionError::InvalidAction {
             task_id: state.task_id.clone(),
@@ -424,6 +435,101 @@ pub fn accept_model_action_proposal(
         )
         .map_err(|_| TaskTransitionError::CheckpointClock)?,
     );
+    Ok(state)
+}
+
+pub fn begin_current_action_execution(
+    mut state: TaskState,
+) -> Result<TaskState, TaskTransitionError> {
+    ensure_not_terminal(&state)?;
+    if let Some(blocker) = state.blocker.clone() {
+        return Err(TaskTransitionError::BlockedTask {
+            task_id: state.task_id,
+            blocker,
+        });
+    }
+    let Some(action) = state.current_action.as_mut() else {
+        return Err(TaskTransitionError::InvalidAction {
+            task_id: state.task_id,
+            reason: "cannot begin execution without a current action".to_string(),
+        });
+    };
+    match action.status {
+        AgentActionStatus::Accepted if action.boundary.state == ActionBoundaryState::Planned => {}
+        AgentActionStatus::Accepted => {
+            return Err(TaskTransitionError::InvalidAction {
+                task_id: state.task_id,
+                reason: format!(
+                    "cannot begin accepted action from {:?} boundary state",
+                    action.boundary.state
+                ),
+            });
+        }
+        AgentActionStatus::Executing if action.boundary.state == ActionBoundaryState::Prepared => {
+            return Ok(state);
+        }
+        AgentActionStatus::Executing => {
+            return Err(TaskTransitionError::InvalidAction {
+                task_id: state.task_id,
+                reason: format!(
+                    "cannot continue executing action from {:?} boundary state",
+                    action.boundary.state
+                ),
+            });
+        }
+        AgentActionStatus::Observed
+        | AgentActionStatus::Verified
+        | AgentActionStatus::Blocked
+        | AgentActionStatus::Failed => {
+            return Err(TaskTransitionError::InvalidAction {
+                task_id: state.task_id,
+                reason: format!(
+                    "cannot begin execution from {:?} action status",
+                    action.status
+                ),
+            });
+        }
+    }
+
+    action.status = AgentActionStatus::Executing;
+    action.boundary.state = ActionBoundaryState::Prepared;
+    Ok(state)
+}
+
+pub fn observe_current_action(
+    mut state: TaskState,
+    observation: &RuntimeObservation,
+) -> Result<TaskState, TaskTransitionError> {
+    ensure_not_terminal(&state)?;
+    let can_observe = state.current_action.as_ref().is_some_and(|action| {
+        action.status == AgentActionStatus::Executing
+            && action.boundary.state == ActionBoundaryState::Prepared
+    });
+    if !can_observe {
+        state.last_runtime_observation = Some(observation.clone());
+        return Ok(state);
+    }
+
+    let Some(evidence) = state
+        .current_action
+        .as_ref()
+        .and_then(|action| action_evidence_for_observation(action, observation))
+    else {
+        state.last_runtime_observation = Some(observation.clone());
+        return Ok(state);
+    };
+
+    let action = state
+        .current_action
+        .as_mut()
+        .expect("current action matched observation evidence");
+    action.status = AgentActionStatus::Observed;
+    action.boundary.state = ActionBoundaryState::Committed;
+    action.last_observation = Some(
+        AgentActionObservation::new(action.boundary.id.clone(), evidence)
+            .map_err(|_| TaskTransitionError::CheckpointClock)?,
+    );
+    state.last_runtime_observation = Some(observation.clone());
     Ok(state)
 }
 
@@ -498,6 +604,16 @@ fn mark_current_action(
         };
     }
     Ok(state)
+}
+
+fn current_action_is_open(action: &AgentAction) -> bool {
+    matches!(
+        action.status,
+        AgentActionStatus::Accepted | AgentActionStatus::Executing
+    ) || matches!(
+        action.boundary.state,
+        ActionBoundaryState::Planned | ActionBoundaryState::Prepared
+    )
 }
 
 pub fn clear_agent_activity(mut state: TaskState) -> TaskState {
@@ -579,6 +695,7 @@ fn foreground_available(
     mut state: TaskState,
     observation: RuntimeObservation,
 ) -> Result<TaskState, TaskTransitionError> {
+    let action_observation = observation.clone();
     let was_waiting_for_foreground = matches!(
         state.blocker,
         Some(TaskBlocker::WaitingForForeground { .. })
@@ -604,7 +721,7 @@ fn foreground_available(
             }),
             "foreground observation accepted",
         )?);
-        state = mark_current_action(state, AgentActionStatus::Observed)?;
+        state = observe_current_action(state, &action_observation)?;
     } else {
         state.current_activity = blocker_activity(&blocker)?;
         state = mark_current_action(state, AgentActionStatus::Blocked)?;
@@ -644,6 +761,7 @@ fn external_condition_satisfied(
     mut state: TaskState,
     observation: RuntimeObservation,
 ) -> Result<TaskState, TaskTransitionError> {
+    let action_observation = observation.clone();
     let was_waiting_for_external_condition = matches!(
         state.blocker,
         Some(TaskBlocker::WaitingForExternalCondition { .. })
@@ -668,7 +786,7 @@ fn external_condition_satisfied(
             Some(AgentActivityTarget::Network),
             "external condition satisfied",
         )?);
-        state = mark_current_action(state, AgentActionStatus::Observed)?;
+        state = observe_current_action(state, &action_observation)?;
     } else {
         state.current_activity = blocker_activity(&blocker)?;
         state = mark_current_action(state, AgentActionStatus::Blocked)?;
@@ -752,6 +870,73 @@ fn observed_package_from_observation(observation: &Option<RuntimeObservation>) -
     }
 }
 
+fn action_evidence_for_observation(
+    action: &AgentAction,
+    observation: &RuntimeObservation,
+) -> Option<AgentActionEvidence> {
+    match &observation.event {
+        RuntimeEvent::ForegroundAppChanged {
+            package_name,
+            activity_name,
+        } if action_accepts_foreground_package(action, package_name) => {
+            Some(AgentActionEvidence::ForegroundPackage {
+                package_name: package_name.clone(),
+                activity_name: activity_name.clone(),
+            })
+        }
+        RuntimeEvent::NetworkAvailabilityChanged { available: true }
+            if action_accepts_network_available(action) =>
+        {
+            Some(AgentActionEvidence::NetworkAvailable)
+        }
+        RuntimeEvent::RuntimeActionFailed {
+            action: name,
+            reason,
+        } if action_accepts_runtime_failure(action, name) => {
+            Some(AgentActionEvidence::RuntimeActionFailed {
+                action: name.clone(),
+                reason: reason.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn action_accepts_foreground_package(action: &AgentAction, package_name: &str) -> bool {
+    match (&action.kind, &action.target) {
+        (
+            AgentActionKind::OpenApp
+            | AgentActionKind::Interact
+            | AgentActionKind::Observe
+            | AgentActionKind::Verify,
+            Some(AgentActivityTarget::AndroidPackage {
+                package_name: expected,
+            }),
+        ) => expected == package_name,
+        _ => false,
+    }
+}
+
+fn action_accepts_network_available(action: &AgentAction) -> bool {
+    matches!(
+        (&action.kind, &action.target),
+        (
+            AgentActionKind::Observe | AgentActionKind::Verify,
+            Some(AgentActivityTarget::Network)
+        )
+    )
+}
+
+fn action_accepts_runtime_failure(action: &AgentAction, failed_action: &str) -> bool {
+    matches!(
+        (&action.kind, &action.target),
+        (
+            AgentActionKind::Execute,
+            Some(AgentActivityTarget::RuntimeAction { name })
+        ) if name == failed_action
+    )
+}
+
 fn blocker_activity(
     blocker: &Option<TaskBlocker>,
 ) -> Result<Option<AgentActivity>, TaskTransitionError> {
@@ -796,7 +981,10 @@ fn blocker_reason(blocker: &Option<TaskBlocker>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fawx_kernel::{ActionBoundaryState, CapabilityGrant, CapabilitySurface};
+    use fawx_kernel::{
+        ActionBoundaryState, AgentActionEvidence, AgentActionStatus, CapabilityGrant,
+        CapabilitySurface,
+    };
 
     fn foreground_observation(package_name: &str) -> RuntimeObservation {
         RuntimeObservation {
@@ -1066,7 +1254,7 @@ mod tests {
     #[test]
     fn model_action_proposal_generates_distinct_boundary_ids() {
         let state = TaskState::new_background_task("task-1", "open settings");
-        let state = accept_model_action_proposal(
+        let mut state = accept_model_action_proposal(
             state,
             ModelActionProposal {
                 kind: ModelActionKind::Observe,
@@ -1084,6 +1272,9 @@ mod tests {
                 .map(|action| action.boundary.id.as_str()),
             Some("model-action:task-1:1")
         );
+        let action = state.current_action.as_mut().expect("current action");
+        action.status = AgentActionStatus::Observed;
+        action.boundary.state = ActionBoundaryState::Committed;
 
         let state = accept_model_action_proposal(
             state,
@@ -1105,6 +1296,84 @@ mod tests {
             Some("model-action:task-1:2")
         );
         assert_eq!(state.action_sequence, 2);
+    }
+
+    #[test]
+    fn model_action_proposal_rejects_replacing_open_current_action() {
+        let state = accept_model_action_proposal(
+            TaskState::new_background_task("task-1", "open settings"),
+            ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                reason: "open settings".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect("accept first action");
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.google.android.apps.nexuslauncher".to_string(),
+                }),
+                reason: "open launcher instead".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("open action must not be replaced");
+
+        assert!(matches!(error, TaskTransitionError::InvalidAction { .. }));
+    }
+
+    #[test]
+    fn model_action_proposal_allows_new_action_after_observation_closes_previous() {
+        let state = begin_current_action_execution(
+            accept_model_action_proposal(
+                TaskState::new_background_task("task-1", "open settings"),
+                ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.android.settings".to_string(),
+                    }),
+                    reason: "open settings".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                },
+            )
+            .expect("accept first action"),
+        )
+        .expect("begin first action");
+        let state = observe_current_action(state, &foreground_observation("com.android.settings"))
+            .expect("observe first action");
+
+        let state = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.google.android.apps.nexuslauncher".to_string(),
+                }),
+                reason: "open launcher next".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect("accept second action after first closed");
+
+        let action = state.current_action.expect("current action");
+        assert_eq!(action.status, AgentActionStatus::Accepted);
+        assert_eq!(action.boundary.id, "model-action:task-1:2");
+        assert!(matches!(
+            action.target,
+            Some(AgentActivityTarget::AndroidPackage { package_name })
+                if package_name == "com.google.android.apps.nexuslauncher"
+        ));
     }
 
     #[test]
@@ -1143,6 +1412,199 @@ mod tests {
         .expect_err("unknown target should reject for concrete action");
 
         assert!(matches!(error, TaskTransitionError::InvalidAction { .. }));
+    }
+
+    #[test]
+    fn begin_current_action_execution_marks_boundary_prepared() {
+        let state = accept_model_action_proposal(
+            TaskState::new_background_task("task-1", "open settings"),
+            ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                reason: "open settings".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect("accept action");
+
+        let state = begin_current_action_execution(state).expect("begin action");
+        let action = state.current_action.expect("current action");
+
+        assert_eq!(action.status, AgentActionStatus::Executing);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Prepared);
+        assert!(action.last_observation.is_none());
+    }
+
+    #[test]
+    fn observe_current_action_records_matching_foreground_evidence() {
+        let state = begin_current_action_execution(
+            accept_model_action_proposal(
+                TaskState::new_background_task("task-1", "open settings"),
+                ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.android.settings".to_string(),
+                    }),
+                    reason: "open settings".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                },
+            )
+            .expect("accept action"),
+        )
+        .expect("begin action");
+        let observation = foreground_observation("com.android.settings");
+
+        let state = observe_current_action(state, &observation).expect("observe action");
+        let action = state.current_action.expect("current action");
+
+        assert_eq!(action.status, AgentActionStatus::Observed);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Committed);
+        assert!(matches!(
+            action.last_observation.as_ref().map(|value| &value.evidence),
+            Some(AgentActionEvidence::ForegroundPackage { package_name, .. })
+                if package_name == "com.android.settings"
+        ));
+        assert_eq!(state.last_runtime_observation, Some(observation));
+    }
+
+    #[test]
+    fn observe_current_action_does_not_skip_execution() {
+        let state = accept_model_action_proposal(
+            TaskState::new_background_task("task-1", "open settings"),
+            ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                reason: "open settings".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect("accept action");
+        let observation = foreground_observation("com.android.settings");
+
+        let state = observe_current_action(state, &observation).expect("observe action");
+        let action = state.current_action.expect("current action");
+
+        assert_eq!(action.status, AgentActionStatus::Accepted);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Planned);
+        assert!(action.last_observation.is_none());
+        assert_eq!(state.last_runtime_observation, Some(observation));
+    }
+
+    #[test]
+    fn observe_current_action_does_not_close_mismatched_foreground() {
+        let state = begin_current_action_execution(
+            accept_model_action_proposal(
+                TaskState::new_background_task("task-1", "open settings"),
+                ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.android.settings".to_string(),
+                    }),
+                    reason: "open settings".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                },
+            )
+            .expect("accept action"),
+        )
+        .expect("begin action");
+        let observation = foreground_observation("com.google.android.apps.nexuslauncher");
+
+        let state = observe_current_action(state, &observation).expect("observe action");
+        let action = state.current_action.expect("current action");
+
+        assert_eq!(action.status, AgentActionStatus::Executing);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Prepared);
+        assert!(action.last_observation.is_none());
+        assert_eq!(state.last_runtime_observation, Some(observation));
+    }
+
+    #[test]
+    fn begin_current_action_execution_does_not_reopen_observed_action() {
+        let state = begin_current_action_execution(
+            accept_model_action_proposal(
+                TaskState::new_background_task("task-1", "open settings"),
+                ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.android.settings".to_string(),
+                    }),
+                    reason: "open settings".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                },
+            )
+            .expect("accept action"),
+        )
+        .expect("begin action");
+        let state = observe_current_action(state, &foreground_observation("com.android.settings"))
+            .expect("observe action");
+
+        let error =
+            begin_current_action_execution(state).expect_err("observed action must not regress");
+
+        assert!(matches!(error, TaskTransitionError::InvalidAction { .. }));
+    }
+
+    #[test]
+    fn begin_current_action_execution_rejects_closed_boundary_even_if_status_is_accepted() {
+        let mut state = accept_model_action_proposal(
+            TaskState::new_background_task("task-1", "open settings"),
+            ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                reason: "open settings".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect("accept action");
+        state
+            .current_action
+            .as_mut()
+            .expect("current action")
+            .boundary
+            .state = ActionBoundaryState::Committed;
+
+        let error = begin_current_action_execution(state)
+            .expect_err("accepted action with committed boundary must not reopen");
+
+        assert!(matches!(error, TaskTransitionError::InvalidAction { .. }));
+    }
+
+    #[test]
+    fn targetless_observe_does_not_close_from_unrelated_foreground() {
+        let state = begin_current_action_execution(
+            accept_model_action_proposal(
+                TaskState::new_background_task("task-1", "observe"),
+                ModelActionProposal {
+                    kind: ModelActionKind::Observe,
+                    target: None,
+                    reason: "observe the environment".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                },
+            )
+            .expect("accept action"),
+        )
+        .expect("begin action");
+
+        let state = observe_current_action(state, &foreground_observation("com.android.settings"))
+            .expect("observe action");
+        let action = state.current_action.expect("current action");
+
+        assert_eq!(action.status, AgentActionStatus::Executing);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Prepared);
+        assert!(action.last_observation.is_none());
     }
 
     #[test]
