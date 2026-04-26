@@ -65,6 +65,21 @@ echo "$agent_model_action_output"
 [[ "$agent_model_action_output" == *'"expected_observation": "settings is foreground"'* ]]
 [[ "$agent_model_action_output" == *'"status": "Accepted"'* ]]
 [[ "$agent_model_action_output" == *'"id": "model-action:task-agent-model-action:1"'* ]]
+"${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' create task-agent-action-closure 'prove action execution and observation closure'"
+agent_action_accept_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' agent-step task-agent-action-closure --action-kind open-app --action-reason 'open launcher to inspect home screen' --action-target android-package:com.google.android.apps.nexuslauncher --expected-observation 'launcher is foreground'")"
+echo "$agent_action_accept_output"
+[[ "$agent_action_accept_output" == *'"status": "Accepted"'* ]]
+agent_action_begin_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' begin-action task-agent-action-closure")"
+echo "$agent_action_begin_output"
+[[ "$agent_action_begin_output" == *'"status": "Executing"'* ]]
+[[ "$agent_action_begin_output" == *'"state": "Prepared"'* ]]
+agent_action_observed_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' agent-step task-agent-action-closure --expected-foreground com.google.android.apps.nexuslauncher --sample-foreground")"
+echo "$agent_action_observed_output"
+[[ "$agent_action_observed_output" == *'"status": "Observed"'* ]]
+[[ "$agent_action_observed_output" == *'"state": "Committed"'* ]]
+[[ "$agent_action_observed_output" == *'"last_observation"'* ]]
+[[ "$agent_action_observed_output" == *'"ForegroundPackage"'* ]]
+[[ "$agent_action_observed_output" == *'"package_name": "com.google.android.apps.nexuslauncher"'* ]]
 "${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' create task-agent-foreground 'prove agent loop foreground contract'"
 agent_foreground_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' agent-step task-agent-foreground --expected-foreground com.android.settings")"
 echo "$agent_foreground_output"
