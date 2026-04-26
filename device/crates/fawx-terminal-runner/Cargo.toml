@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+fawx-agent-loop = { path = "../../../kernel/crates/fawx-agent-loop" }
 fawx-android-adapter = { path = "../fawx-android-adapter" }
 fawx-harness = { path = "../../../kernel/crates/fawx-harness" }
 fawx-kernel = { path = "../../../kernel/crates/fawx-kernel" }

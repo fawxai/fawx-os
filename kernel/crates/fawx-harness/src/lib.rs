@@ -5,7 +5,8 @@
 
 pub use fawx_kernel::TaskPhase;
 use fawx_kernel::{
-    ActionBoundary, AttentionRequirement, ExecutionContract, TaskBlocker, TaskCheckpoint,
+    ActionBoundary, AgentActivity, AgentActivityKind, AgentActivitySource, AgentActivityTarget,
+    AttentionRequirement, ExecutionContract, TaskBlocker, TaskCheckpoint,
 };
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -83,6 +84,8 @@ pub struct TaskState {
     pub checkpoint: Option<TaskCheckpoint>,
     pub blocker: Option<TaskBlocker>,
     #[serde(default)]
+    pub current_activity: Option<AgentActivity>,
+    #[serde(default)]
     pub last_runtime_observation: Option<RuntimeObservation>,
 }
 
@@ -102,6 +105,7 @@ impl TaskState {
             },
             checkpoint: None,
             blocker: None,
+            current_activity: None,
             last_runtime_observation: None,
         }
     }
@@ -172,7 +176,80 @@ pub fn require_foreground_attention(
     reason: impl Into<String>,
 ) -> Result<TaskState, TaskTransitionError> {
     ensure_not_terminal(&state)?;
-    foreground_required(state, &reason.into(), None)
+    foreground_required(state, &reason.into(), None, None)
+}
+
+pub fn require_foreground_attention_for_package(
+    state: TaskState,
+    expected_package: impl Into<String>,
+    reason: impl Into<String>,
+) -> Result<TaskState, TaskTransitionError> {
+    ensure_not_terminal(&state)?;
+    let expected_package = expected_package.into();
+    foreground_required(
+        state,
+        &reason.into(),
+        None,
+        Some(AgentActivityTarget::AndroidPackage {
+            package_name: expected_package,
+        }),
+    )
+}
+
+pub fn require_external_condition(
+    state: TaskState,
+    reason: impl Into<String>,
+    observation: Option<RuntimeObservation>,
+) -> Result<TaskState, TaskTransitionError> {
+    ensure_not_terminal(&state)?;
+    external_condition_required(state, &reason.into(), observation)
+}
+
+pub fn satisfy_external_condition(
+    state: TaskState,
+    observation: RuntimeObservation,
+) -> Result<TaskState, TaskTransitionError> {
+    ensure_not_terminal(&state)?;
+    external_condition_satisfied(state, observation)
+}
+
+pub fn record_planning_activity(
+    state: TaskState,
+    description: impl Into<String>,
+) -> Result<TaskState, TaskTransitionError> {
+    ensure_not_terminal(&state)?;
+    if let Some(blocker) = state.blocker.clone() {
+        return Err(TaskTransitionError::BlockedTask {
+            task_id: state.task_id,
+            blocker,
+        });
+    }
+    let mut state = state;
+    state.current_activity = Some(system_activity(
+        AgentActivityKind::Planning,
+        Some(AgentActivityTarget::Task),
+        description,
+    )?);
+    Ok(state)
+}
+
+pub fn record_current_blocker_activity(state: TaskState) -> Result<TaskState, TaskTransitionError> {
+    ensure_not_terminal(&state)?;
+    let mut state = state;
+    let existing_activity_matches_blocker = matches!(
+        (&state.current_activity, blocker_reason(&state.blocker)),
+        (Some(activity), Some(reason))
+            if activity.kind == AgentActivityKind::Waiting && activity.description == reason
+    );
+    if !existing_activity_matches_blocker {
+        state.current_activity = blocker_activity(&state.blocker)?;
+    }
+    Ok(state)
+}
+
+pub fn clear_agent_activity(mut state: TaskState) -> TaskState {
+    state.current_activity = None;
+    state
 }
 
 pub fn apply_foreground_policy(
@@ -215,9 +292,14 @@ pub fn apply_foreground_policy(
         ForegroundPolicyDecision::ContinueInBackground { .. } => {
             foreground_available(state, observation.clone())?
         }
-        ForegroundPolicyDecision::RequireForeground { reason } => {
-            foreground_required(state, reason, Some(observation.clone()))?
-        }
+        ForegroundPolicyDecision::RequireForeground { reason } => foreground_required(
+            state,
+            reason,
+            Some(observation.clone()),
+            Some(AgentActivityTarget::AndroidPackage {
+                package_name: expected_package.to_string(),
+            }),
+        )?,
     };
 
     Ok((state, decision))
@@ -244,6 +326,16 @@ fn foreground_available(
         }
         state.mode = ExecutionMode::BackgroundCapable;
         state.attention_requirement = AttentionRequirement::BackgroundAllowed;
+        state.current_activity = Some(system_activity(
+            AgentActivityKind::Observing,
+            Some(AgentActivityTarget::AndroidPackage {
+                package_name: observed_package_from_observation(&state.last_runtime_observation)
+                    .unwrap_or_else(|| "unknown".to_string()),
+            }),
+            "foreground observation accepted",
+        )?);
+    } else {
+        state.current_activity = blocker_activity(&blocker)?;
     }
 
     Ok(state)
@@ -253,6 +345,7 @@ fn foreground_required(
     mut state: TaskState,
     reason: &str,
     observation: Option<RuntimeObservation>,
+    target: Option<AgentActivityTarget>,
 ) -> Result<TaskState, TaskTransitionError> {
     let blocker = match state.blocker.take() {
         Some(TaskBlocker::WaitingForForeground { .. }) | None => {
@@ -271,6 +364,69 @@ fn foreground_required(
 
     state.blocker = blocker.clone();
     state.last_runtime_observation = observation;
+    state.current_activity = blocker_activity_with_target(&blocker, target)?;
+    Ok(state)
+}
+
+fn external_condition_satisfied(
+    mut state: TaskState,
+    observation: RuntimeObservation,
+) -> Result<TaskState, TaskTransitionError> {
+    let was_waiting_for_external_condition = matches!(
+        state.blocker,
+        Some(TaskBlocker::WaitingForExternalCondition { .. })
+    );
+    let blocker = match state.blocker.take() {
+        Some(TaskBlocker::WaitingForExternalCondition { .. }) | None => None,
+        Some(blocker) => Some(blocker),
+    };
+    state.blocker = blocker.clone();
+    state.last_runtime_observation = Some(observation);
+
+    if blocker.is_none() && was_waiting_for_external_condition {
+        state.phase = if state.checkpoint.is_some() {
+            TaskPhase::Checkpointed
+        } else {
+            TaskPhase::Running
+        };
+        state.mode = ExecutionMode::BackgroundCapable;
+        state.attention_requirement = AttentionRequirement::BackgroundAllowed;
+        state.current_activity = Some(system_activity(
+            AgentActivityKind::Observing,
+            Some(AgentActivityTarget::Network),
+            "external condition satisfied",
+        )?);
+    } else {
+        state.current_activity = blocker_activity(&blocker)?;
+    }
+
+    Ok(state)
+}
+
+fn external_condition_required(
+    mut state: TaskState,
+    reason: &str,
+    observation: Option<RuntimeObservation>,
+) -> Result<TaskState, TaskTransitionError> {
+    let blocker = match state.blocker.take() {
+        Some(TaskBlocker::WaitingForExternalCondition { .. }) | None => {
+            Some(TaskBlocker::WaitingForExternalCondition {
+                reason: reason.to_string(),
+            })
+        }
+        Some(blocker) => Some(blocker),
+    };
+
+    if matches!(
+        blocker,
+        Some(TaskBlocker::WaitingForExternalCondition { .. })
+    ) {
+        state.phase = TaskPhase::Waiting;
+    }
+
+    state.blocker = blocker.clone();
+    state.last_runtime_observation = observation;
+    state.current_activity = blocker_activity(&blocker)?;
     Ok(state)
 }
 
@@ -299,6 +455,68 @@ fn new_checkpoint(
         blocker,
     )
     .map_err(|_| TaskTransitionError::CheckpointClock)
+}
+
+fn system_activity(
+    kind: AgentActivityKind,
+    target: Option<AgentActivityTarget>,
+    description: impl Into<String>,
+) -> Result<AgentActivity, TaskTransitionError> {
+    AgentActivity::new(
+        kind,
+        target,
+        description,
+        AgentActivitySource::SystemDerived,
+    )
+    .map_err(|_| TaskTransitionError::CheckpointClock)
+}
+
+fn observed_package_from_observation(observation: &Option<RuntimeObservation>) -> Option<String> {
+    match observation.as_ref().map(|observation| &observation.event) {
+        Some(RuntimeEvent::ForegroundAppChanged { package_name, .. }) => Some(package_name.clone()),
+        _ => None,
+    }
+}
+
+fn blocker_activity(
+    blocker: &Option<TaskBlocker>,
+) -> Result<Option<AgentActivity>, TaskTransitionError> {
+    blocker_activity_with_target(blocker, None)
+}
+
+fn blocker_activity_with_target(
+    blocker: &Option<TaskBlocker>,
+    target_override: Option<AgentActivityTarget>,
+) -> Result<Option<AgentActivity>, TaskTransitionError> {
+    match blocker {
+        Some(TaskBlocker::WaitingForForeground { reason }) => Ok(Some(system_activity(
+            AgentActivityKind::Waiting,
+            target_override,
+            reason.clone(),
+        )?)),
+        Some(TaskBlocker::WaitingForExternalCondition { reason }) => Ok(Some(system_activity(
+            AgentActivityKind::Waiting,
+            Some(AgentActivityTarget::Network),
+            reason.clone(),
+        )?)),
+        Some(TaskBlocker::WaitingForUserApproval { reason })
+        | Some(TaskBlocker::WaitingForUserInput { reason }) => Ok(Some(system_activity(
+            AgentActivityKind::Waiting,
+            Some(AgentActivityTarget::Task),
+            reason.clone(),
+        )?)),
+        None => Ok(None),
+    }
+}
+
+fn blocker_reason(blocker: &Option<TaskBlocker>) -> Option<&str> {
+    match blocker {
+        Some(TaskBlocker::WaitingForForeground { reason })
+        | Some(TaskBlocker::WaitingForExternalCondition { reason })
+        | Some(TaskBlocker::WaitingForUserApproval { reason })
+        | Some(TaskBlocker::WaitingForUserInput { reason }) => Some(reason.as_str()),
+        None => None,
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +567,7 @@ mod tests {
             blocker: Some(TaskBlocker::WaitingForExternalCondition {
                 reason: "waiting for provider confirmation".to_string(),
             }),
+            current_activity: None,
             last_runtime_observation: None,
         };
 
@@ -372,6 +591,7 @@ mod tests {
             blocker: Some(TaskBlocker::WaitingForForeground {
                 reason: "checkout flow needs active app focus".to_string(),
             }),
+            current_activity: None,
             last_runtime_observation: None,
         };
 
@@ -383,6 +603,28 @@ mod tests {
             state.blocker,
             Some(TaskBlocker::WaitingForForeground { .. })
         ));
+    }
+
+    #[test]
+    fn old_task_json_without_current_activity_deserializes() {
+        let payload = r#"{
+          "task_id": "task-1",
+          "phase": "Running",
+          "mode": "BackgroundCapable",
+          "attention_requirement": "BackgroundAllowed",
+          "contract": {
+            "grants": [],
+            "user_intent": "legacy task"
+          },
+          "checkpoint": null,
+          "blocker": null,
+          "last_runtime_observation": null
+        }"#;
+
+        let state: TaskState = serde_json::from_str(payload).expect("deserialize legacy task");
+
+        assert_eq!(state.task_id, "task-1");
+        assert!(state.current_activity.is_none());
     }
 
     #[test]
@@ -430,6 +672,11 @@ mod tests {
         ));
         assert_eq!(state.checkpoint, None);
         assert_eq!(state.last_runtime_observation, Some(observation));
+        assert!(matches!(
+            state.current_activity.as_ref().and_then(|activity| activity.target.as_ref()),
+            Some(AgentActivityTarget::AndroidPackage { package_name })
+                if package_name == "com.android.settings"
+        ));
     }
 
     #[test]
@@ -540,6 +787,173 @@ mod tests {
         assert_eq!(state.checkpoint, original_checkpoint);
         assert_eq!(state.last_runtime_observation, Some(observation));
         assert!(state.blocker.is_none());
+    }
+
+    #[test]
+    fn external_condition_sets_waiting_blocker_and_preserves_checkpoint() {
+        let mut state = TaskState::new_background_task("task-1", "wait for network");
+        state = record_action_checkpoint(
+            state,
+            ActionBoundary::new(
+                "support-form-submit",
+                ActionBoundaryState::Committed,
+                "support form submitted",
+            ),
+        )
+        .expect("record action checkpoint");
+        let original_checkpoint = state.checkpoint.clone();
+        let observation = RuntimeObservation {
+            source: RuntimeObservationSource::Android {
+                substrate: "ReconRootedStock".to_string(),
+            },
+            event: RuntimeEvent::NetworkAvailabilityChanged { available: false },
+        };
+
+        let state =
+            require_external_condition(state, "network unavailable", Some(observation.clone()))
+                .expect("require external condition");
+
+        assert_eq!(state.phase, TaskPhase::Waiting);
+        assert_eq!(state.checkpoint, original_checkpoint);
+        assert_eq!(state.last_runtime_observation, Some(observation));
+        assert!(matches!(
+            state.blocker,
+            Some(TaskBlocker::WaitingForExternalCondition { .. })
+        ));
+        assert!(matches!(
+            state
+                .current_activity
+                .as_ref()
+                .map(|activity| activity.kind),
+            Some(AgentActivityKind::Waiting)
+        ));
+        assert!(matches!(
+            state
+                .current_activity
+                .as_ref()
+                .and_then(|activity| activity.target.as_ref()),
+            Some(AgentActivityTarget::Network)
+        ));
+    }
+
+    #[test]
+    fn external_condition_preserves_unrelated_blocker() {
+        let mut state = TaskState::new_background_task("task-1", "approve checkout");
+        state.phase = TaskPhase::Waiting;
+        state.blocker = Some(TaskBlocker::WaitingForUserApproval {
+            reason: "approve checkout".to_string(),
+        });
+        let observation = RuntimeObservation {
+            source: RuntimeObservationSource::Android {
+                substrate: "ReconRootedStock".to_string(),
+            },
+            event: RuntimeEvent::NetworkAvailabilityChanged { available: false },
+        };
+
+        let state =
+            require_external_condition(state, "network unavailable", Some(observation.clone()))
+                .expect("require external condition");
+
+        assert_eq!(state.phase, TaskPhase::Waiting);
+        assert_eq!(state.last_runtime_observation, Some(observation));
+        assert!(matches!(
+            state.blocker,
+            Some(TaskBlocker::WaitingForUserApproval { .. })
+        ));
+        assert_eq!(
+            state
+                .current_activity
+                .as_ref()
+                .map(|activity| activity.description.as_str()),
+            Some("approve checkout")
+        );
+    }
+
+    #[test]
+    fn external_condition_satisfaction_clears_matching_blocker() {
+        let state = TaskState::new_background_task("task-1", "wait for network");
+        let blocked = require_external_condition(state, "network unavailable", None)
+            .expect("require external condition");
+        let observation = RuntimeObservation {
+            source: RuntimeObservationSource::Android {
+                substrate: "ReconRootedStock".to_string(),
+            },
+            event: RuntimeEvent::NetworkAvailabilityChanged { available: true },
+        };
+
+        let state =
+            satisfy_external_condition(blocked, observation.clone()).expect("satisfy condition");
+
+        assert_eq!(state.phase, TaskPhase::Running);
+        assert!(state.blocker.is_none());
+        assert_eq!(state.last_runtime_observation, Some(observation));
+        assert!(matches!(
+            state
+                .current_activity
+                .as_ref()
+                .map(|activity| activity.kind),
+            Some(AgentActivityKind::Observing)
+        ));
+    }
+
+    #[test]
+    fn external_condition_satisfaction_preserves_checkpoint_phase() {
+        let mut state = TaskState::new_background_task("task-1", "wait for receipt");
+        state = record_action_checkpoint(
+            state,
+            ActionBoundary::new(
+                "support-form-submit",
+                ActionBoundaryState::Committed,
+                "support form submitted",
+            ),
+        )
+        .expect("record action checkpoint");
+        let blocked = require_external_condition(state, "waiting for provider confirmation", None)
+            .expect("require external condition");
+        let observation = RuntimeObservation {
+            source: RuntimeObservationSource::Android {
+                substrate: "ReconRootedStock".to_string(),
+            },
+            event: RuntimeEvent::NetworkAvailabilityChanged { available: true },
+        };
+
+        let state =
+            satisfy_external_condition(blocked, observation).expect("satisfy external condition");
+
+        assert_eq!(state.phase, TaskPhase::Checkpointed);
+        assert!(state.blocker.is_none());
+        assert!(state.checkpoint.is_some());
+    }
+
+    #[test]
+    fn external_condition_satisfaction_preserves_unrelated_blocker() {
+        let mut state = TaskState::new_background_task("task-1", "approve checkout");
+        state.phase = TaskPhase::Waiting;
+        state.blocker = Some(TaskBlocker::WaitingForUserApproval {
+            reason: "approve checkout".to_string(),
+        });
+        let observation = RuntimeObservation {
+            source: RuntimeObservationSource::Android {
+                substrate: "ReconRootedStock".to_string(),
+            },
+            event: RuntimeEvent::NetworkAvailabilityChanged { available: true },
+        };
+
+        let state =
+            satisfy_external_condition(state, observation).expect("satisfy external condition");
+
+        assert_eq!(state.phase, TaskPhase::Waiting);
+        assert!(matches!(
+            state.blocker,
+            Some(TaskBlocker::WaitingForUserApproval { .. })
+        ));
+        assert_eq!(
+            state
+                .current_activity
+                .as_ref()
+                .map(|activity| activity.description.as_str()),
+            Some("approve checkout")
+        );
     }
 
     #[test]

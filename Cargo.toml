@@ -2,6 +2,7 @@
 members = [
     "kernel/crates/fawx-kernel",
     "kernel/crates/fawx-harness",
+    "kernel/crates/fawx-agent-loop",
     "kernel/crates/fawx-task-store",
     "cloud/crates/fawx-cloud-contracts",
     "browser/crates/fawx-browser-contracts",

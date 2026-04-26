@@ -67,6 +67,78 @@ pub enum TaskBlocker {
     WaitingForExternalCondition { reason: String },
 }
 
+/// A coarse typed description of the agent's current activity. This is backend
+/// state, not a UI string contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentActivityKind {
+    Observing,
+    Planning,
+    Executing,
+    Waiting,
+    Verifying,
+    Summarizing,
+}
+
+/// What the current activity is about, when the backend can express that
+/// without guessing from prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentActivityTarget {
+    AndroidPackage { package_name: String },
+    Url { url: String },
+    File { path: String },
+    Service { name: String },
+    Contact { label: String },
+    Network,
+    RuntimeAction { name: String },
+    Task,
+    Unknown,
+}
+
+/// Where an activity description came from. This lets future renderers treat
+/// model-declared intent differently from tool-derived or system-derived state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentActivitySource {
+    ModelDeclared,
+    ToolDerived,
+    SystemDerived,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentActivity {
+    pub kind: AgentActivityKind,
+    pub target: Option<AgentActivityTarget>,
+    pub description: String,
+    pub source: AgentActivitySource,
+    pub started_at_ms: u128,
+}
+
+impl AgentActivity {
+    pub fn new(
+        kind: AgentActivityKind,
+        target: Option<AgentActivityTarget>,
+        description: impl Into<String>,
+        source: AgentActivitySource,
+    ) -> Result<Self, CheckpointClockError> {
+        Ok(Self::at(kind, target, description, source, now_ms()?))
+    }
+
+    pub fn at(
+        kind: AgentActivityKind,
+        target: Option<AgentActivityTarget>,
+        description: impl Into<String>,
+        source: AgentActivitySource,
+        started_at_ms: u128,
+    ) -> Self {
+        Self {
+            kind,
+            target,
+            description: description.into(),
+            source,
+            started_at_ms,
+        }
+    }
+}
+
 /// Where an external action boundary sits relative to the outside world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActionBoundaryState {

@@ -31,3 +31,37 @@ echo "== background heartbeat =="
 "${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' create task-heartbeat 'prove background checkpoint updates'"
 "${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' heartbeat task-heartbeat 3 250"
 "${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' status task-heartbeat"
+
+echo "== deterministic agent step =="
+"${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' create task-agent-step 'prove agent loop runner integration'"
+agent_step_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' agent-step task-agent-step")"
+echo "$agent_step_output"
+[[ "$agent_step_output" == *'"phase": "Checkpointed"'* ]]
+[[ "$agent_step_output" == *'"ContinueLocalWork"'* ]]
+[[ "$agent_step_output" == *'"checkpoint_id": "loop:initial-plan"'* ]]
+[[ "$agent_step_output" == *'"current_activity"'* ]]
+[[ "$agent_step_output" == *'"kind": "Planning"'* ]]
+[[ "$agent_step_output" == *'"target": "Task"'* ]]
+[[ "$agent_step_output" == *'"source": "SystemDerived"'* ]]
+"${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' create task-agent-foreground 'prove agent loop foreground contract'"
+agent_foreground_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' agent-step task-agent-foreground --expected-foreground com.android.settings")"
+echo "$agent_foreground_output"
+[[ "$agent_foreground_output" == *'"phase": "Waiting"'* ]]
+[[ "$agent_foreground_output" == *'"WaitingForForeground"'* ]]
+[[ "$agent_foreground_output" == *'"ReacquireForeground"'* ]]
+[[ "$agent_foreground_output" == *'"current_activity"'* ]]
+[[ "$agent_foreground_output" == *'"kind": "Waiting"'* ]]
+[[ "$agent_foreground_output" == *'"AndroidPackage"'* ]]
+[[ "$agent_foreground_output" == *'"package_name": "com.android.settings"'* ]]
+[[ "$agent_foreground_output" == *'"source": "SystemDerived"'* ]]
+"${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' create task-agent-sampled-foreground 'prove sampled foreground observation contract'"
+agent_sampled_foreground_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' agent-step task-agent-sampled-foreground --expected-foreground com.android.settings --sample-foreground")"
+echo "$agent_sampled_foreground_output"
+[[ "$agent_sampled_foreground_output" == *'"last_runtime_observation"'* ]]
+[[ "$agent_sampled_foreground_output" == *'"ForegroundAppChanged"'* ]]
+[[ "$agent_sampled_foreground_output" == *'"ReacquireForeground"'* ]]
+[[ "$agent_sampled_foreground_output" == *'"current_activity"'* ]]
+[[ "$agent_sampled_foreground_output" == *'"kind": "Waiting"'* ]]
+[[ "$agent_sampled_foreground_output" == *'"AndroidPackage"'* ]]
+[[ "$agent_sampled_foreground_output" == *'"package_name": "com.android.settings"'* ]]
+[[ "$agent_sampled_foreground_output" == *'"source": "SystemDerived"'* ]]

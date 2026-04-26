@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
+use fawx_agent_loop::{AgentLoop, LoopStepRequest};
 use fawx_android_adapter::{
     AndroidEvent, AndroidForegroundUnavailableReason, AndroidObservation, AndroidSubstrate,
     foreground_observation,
@@ -68,6 +69,11 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
                 store.transition_state(task_id, |state| foreground_block_state(reason, state))?;
             print_task(&task)?;
         }
+        "agent-step" => {
+            let task_id = required_arg(&args, 1, "task id")?;
+            let options = AgentStepOptions::parse(&args[2..])?;
+            run_agent_step(&store, task_id, options)?;
+        }
         "heartbeat" => {
             let task_id = required_arg(&args, 1, "task id")?;
             let count = optional_usize(&args, 2, 5)?;
@@ -97,6 +103,69 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         _ => print_usage(),
     }
 
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentStepOptions {
+    expected_foreground_package: Option<String>,
+    sample_foreground: bool,
+}
+
+impl AgentStepOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut expected_foreground_package = None;
+        let mut sample_foreground = false;
+        let mut index = 0;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--expected-foreground" => {
+                    let package = args
+                        .get(index + 1)
+                        .ok_or_else(|| "missing --expected-foreground package".to_string())?;
+                    if package.starts_with("--") {
+                        return Err(format!(
+                            "missing --expected-foreground package before option {package}"
+                        ));
+                    }
+                    expected_foreground_package = Some(package.clone());
+                    index += 2;
+                }
+                "--sample-foreground" => {
+                    sample_foreground = true;
+                    index += 1;
+                }
+                value => return Err(format!("unknown agent-step option: {value}")),
+            }
+        }
+
+        Ok(Self {
+            expected_foreground_package,
+            sample_foreground,
+        })
+    }
+}
+
+fn run_agent_step(
+    store: &TaskStore,
+    task_id: &str,
+    options: AgentStepOptions,
+) -> Result<(), Box<dyn Error>> {
+    let observations = if options.sample_foreground {
+        let android_observation = foreground_observation(AndroidSubstrate::ReconRootedStock);
+        vec![runtime_observation_from_android(&android_observation)]
+    } else {
+        vec![]
+    };
+
+    let result = AgentLoop::new(store.clone()).step(LoopStepRequest {
+        task_id: task_id.to_string(),
+        observations,
+        expected_foreground_package: options.expected_foreground_package,
+    })?;
+
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
 
@@ -347,6 +416,9 @@ fn print_usage() {
     eprintln!("  fawx-terminal-runner list");
     eprintln!("  fawx-terminal-runner checkpoint <task-id> <last-action-boundary>");
     eprintln!("  fawx-terminal-runner block-foreground <task-id> <reason>");
+    eprintln!(
+        "  fawx-terminal-runner agent-step <task-id> [--expected-foreground <package>] [--sample-foreground]"
+    );
     eprintln!("  fawx-terminal-runner heartbeat <task-id> [count] [interval-ms] [--foreground]");
     eprintln!(
         "  fawx-terminal-runner watch-foreground <task-id> <expected-package> [count] [interval-ms]"
@@ -381,5 +453,40 @@ mod tests {
             .expect_err("terminal foreground block should be rejected");
 
         assert!(matches!(error, TaskTransitionError::TerminalTask { .. }));
+    }
+
+    #[test]
+    fn agent_step_options_parse_expected_foreground_and_sampling() {
+        let options = AgentStepOptions::parse(&[
+            "--expected-foreground".to_string(),
+            "com.android.settings".to_string(),
+            "--sample-foreground".to_string(),
+        ])
+        .expect("parse agent step options");
+
+        assert_eq!(
+            options.expected_foreground_package,
+            Some("com.android.settings".to_string())
+        );
+        assert!(options.sample_foreground);
+    }
+
+    #[test]
+    fn agent_step_options_reject_unknown_options() {
+        let error = AgentStepOptions::parse(&["--surprise".to_string()])
+            .expect_err("unknown option should fail");
+
+        assert!(error.contains("--surprise"));
+    }
+
+    #[test]
+    fn agent_step_options_reject_flag_as_expected_foreground_package() {
+        let error = AgentStepOptions::parse(&[
+            "--expected-foreground".to_string(),
+            "--sample-foreground".to_string(),
+        ])
+        .expect_err("flag should not parse as package");
+
+        assert!(error.contains("missing --expected-foreground package"));
     }
 }
