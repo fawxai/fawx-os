@@ -16,7 +16,9 @@ use fawx_harness::{
     require_external_condition, require_foreground_attention_for_package,
     satisfy_external_condition,
 };
-use fawx_kernel::{ActionBoundary, ActionBoundaryState, TaskBlocker};
+use fawx_kernel::{
+    ActionBoundary, ActionBoundaryState, AgentActionStatus, AgentActivityTarget, TaskBlocker,
+};
 use fawx_task_store::{StoredTask, TaskStore, TaskStoreError, TaskStoreTransitionError};
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +49,89 @@ impl LoopStepRequest {
 pub struct LoopStepResult {
     pub task: StoredTask,
     pub decision: LoopDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTickRequest {
+    pub tick_id: u64,
+    #[serde(default)]
+    pub observations: Vec<BackgroundObservation>,
+}
+
+impl BackgroundTickRequest {
+    pub fn new(tick_id: u64) -> Self {
+        Self {
+            tick_id,
+            observations: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundObservation {
+    pub scope: BackgroundObservationScope,
+    pub observation: RuntimeObservation,
+}
+
+impl BackgroundObservation {
+    pub fn global(observation: RuntimeObservation) -> Self {
+        Self {
+            scope: BackgroundObservationScope::Global,
+            observation,
+        }
+    }
+
+    pub fn for_task(task_id: impl Into<String>, observation: RuntimeObservation) -> Self {
+        Self {
+            scope: BackgroundObservationScope::Task {
+                task_id: task_id.into(),
+            },
+            observation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackgroundObservationScope {
+    /// Substrate-wide state, such as network availability, that may be reduced
+    /// by every task. Foreground observations are never treated as global.
+    Global,
+    /// Evidence explicitly owned by one task. Foreground observations require
+    /// this scope so one visible app sample cannot accidentally close several
+    /// unrelated actions.
+    Task { task_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTickResult {
+    pub tick_id: u64,
+    pub tasks: Vec<BackgroundTaskTick>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTaskTick {
+    pub task_id: String,
+    pub outcome: BackgroundTaskTickOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackgroundTaskTickOutcome {
+    Stepped { decision: LoopDecision },
+    SkippedTerminal { phase: TaskPhase },
+    Failed { failure: BackgroundTaskTickFailure },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTaskTickFailure {
+    pub kind: BackgroundTaskTickFailureKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackgroundTaskTickFailureKind {
+    Store,
+    Transition,
+    MissingDecision,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +231,121 @@ impl AgentLoop {
             task,
             decision: decision.ok_or(AgentLoopError::MissingDecision)?,
         })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BackgroundRunner {
+    store: TaskStore,
+}
+
+impl BackgroundRunner {
+    pub fn new(store: TaskStore) -> Self {
+        Self { store }
+    }
+
+    pub fn tick(
+        &self,
+        request: BackgroundTickRequest,
+    ) -> Result<BackgroundTickResult, AgentLoopError> {
+        let mut tasks = Vec::new();
+        let loop_runner = AgentLoop::new(self.store.clone());
+        for stored_task in self.store.list()? {
+            let task_id = stored_task.state.task_id.clone();
+            if stored_task.state.phase.is_terminal() {
+                tasks.push(BackgroundTaskTick {
+                    task_id,
+                    outcome: BackgroundTaskTickOutcome::SkippedTerminal {
+                        phase: stored_task.state.phase,
+                    },
+                });
+                continue;
+            }
+
+            let (observations, expected_foreground_package) =
+                scoped_observations_for_task(&stored_task.state, &request.observations);
+            let step_request = LoopStepRequest {
+                task_id: task_id.clone(),
+                observations,
+                expected_foreground_package,
+                model_activity: None,
+                model_action: None,
+            };
+            let outcome = match loop_runner.step(step_request) {
+                Ok(result) => BackgroundTaskTickOutcome::Stepped {
+                    decision: result.decision,
+                },
+                Err(error) => BackgroundTaskTickOutcome::Failed {
+                    failure: BackgroundTaskTickFailure::from_error(&error),
+                },
+            };
+            tasks.push(BackgroundTaskTick { task_id, outcome });
+        }
+
+        Ok(BackgroundTickResult {
+            tick_id: request.tick_id,
+            tasks,
+        })
+    }
+}
+
+impl BackgroundTaskTickFailure {
+    fn from_error(error: &AgentLoopError) -> Self {
+        let kind = match error {
+            AgentLoopError::Store(_) => BackgroundTaskTickFailureKind::Store,
+            AgentLoopError::Transition(_) => BackgroundTaskTickFailureKind::Transition,
+            AgentLoopError::MissingDecision => BackgroundTaskTickFailureKind::MissingDecision,
+        };
+        Self {
+            kind,
+            message: error.to_string(),
+        }
+    }
+}
+
+fn scoped_observations_for_task(
+    state: &TaskState,
+    observations: &[BackgroundObservation],
+) -> (Vec<RuntimeObservation>, Option<String>) {
+    let expected_foreground_package = expected_foreground_package_from_current_action(state);
+    let mut scoped = Vec::new();
+    for observation in observations {
+        match &observation.scope {
+            BackgroundObservationScope::Global => {
+                if !is_foreground_observation(&observation.observation) {
+                    scoped.push(observation.observation.clone());
+                }
+            }
+            BackgroundObservationScope::Task { task_id } if task_id == &state.task_id => {
+                scoped.push(observation.observation.clone());
+            }
+            BackgroundObservationScope::Task { .. } => {}
+        }
+    }
+
+    let expected_foreground_package = scoped
+        .iter()
+        .any(is_foreground_observation)
+        .then_some(expected_foreground_package)
+        .flatten();
+
+    (scoped, expected_foreground_package)
+}
+
+fn expected_foreground_package_from_current_action(state: &TaskState) -> Option<String> {
+    match state.current_action.as_ref() {
+        Some(action)
+            if action.status == AgentActionStatus::Executing
+                && action.boundary.state == ActionBoundaryState::Prepared =>
+        {
+            match action.target.as_ref() {
+                Some(AgentActivityTarget::AndroidPackage { package_name }) => {
+                    Some(package_name.clone())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -357,6 +557,16 @@ mod tests {
         (store, loop_runner)
     }
 
+    fn test_background_runner() -> (TaskStore, BackgroundRunner) {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let store = TaskStore::new(std::env::temp_dir().join(format!(
+            "fawx-background-runner-test-{}-{id}",
+            std::process::id()
+        )));
+        let runner = BackgroundRunner::new(store.clone());
+        (store, runner)
+    }
+
     fn android_foreground(package_name: &str) -> RuntimeObservation {
         RuntimeObservation {
             source: RuntimeObservationSource::Android {
@@ -367,6 +577,278 @@ mod tests {
                 activity_name: None,
             },
         }
+    }
+
+    #[test]
+    fn background_runner_ticks_all_nonterminal_tasks_in_stable_order() {
+        let (store, runner) = test_background_runner();
+        store
+            .create(TaskState::new_background_task("task-b", "second"))
+            .expect("create task b");
+        store
+            .create(TaskState::new_background_task("task-a", "first"))
+            .expect("create task a");
+
+        let result = runner
+            .tick(BackgroundTickRequest::new(7))
+            .expect("background tick");
+
+        assert_eq!(result.tick_id, 7);
+        assert_eq!(
+            result
+                .tasks
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-a", "task-b"]
+        );
+        assert!(
+            result
+                .tasks
+                .iter()
+                .all(|task| matches!(task.outcome, BackgroundTaskTickOutcome::Stepped { .. }))
+        );
+        assert!(
+            store
+                .load("task-a")
+                .expect("load task a")
+                .state
+                .checkpoint
+                .is_some()
+        );
+        assert!(
+            store
+                .load("task-b")
+                .expect("load task b")
+                .state
+                .checkpoint
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn background_runner_skips_terminal_tasks_without_reopening_them() {
+        let (store, runner) = test_background_runner();
+        store
+            .create(TaskState::new_background_task("task-done", "done"))
+            .expect("create task");
+        store
+            .transition_state("task-done", |mut state| {
+                state.phase = TaskPhase::Completed;
+                Ok::<_, TaskStoreError>(state)
+            })
+            .expect("complete task");
+
+        let result = runner
+            .tick(BackgroundTickRequest::new(1))
+            .expect("background tick");
+
+        assert_eq!(result.tasks.len(), 1);
+        assert_eq!(result.tasks[0].task_id, "task-done");
+        assert_eq!(
+            result.tasks[0].outcome,
+            BackgroundTaskTickOutcome::SkippedTerminal {
+                phase: TaskPhase::Completed
+            }
+        );
+        assert_eq!(
+            store.load("task-done").expect("load task").state.phase,
+            TaskPhase::Completed
+        );
+    }
+
+    #[test]
+    fn background_runner_reduces_observations_for_waiting_tasks() {
+        let (store, runner) = test_background_runner();
+        store
+            .create(TaskState::new_background_task(
+                "task-network",
+                "wait for network",
+            ))
+            .expect("create task");
+        AgentLoop::new(store.clone())
+            .step(LoopStepRequest {
+                task_id: "task-network".to_string(),
+                observations: vec![RuntimeObservation {
+                    source: RuntimeObservationSource::Cloud {
+                        provider: "test".to_string(),
+                    },
+                    event: RuntimeEvent::NetworkAvailabilityChanged { available: false },
+                }],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: None,
+            })
+            .expect("block on network");
+
+        let result = runner
+            .tick(BackgroundTickRequest {
+                tick_id: 2,
+                observations: vec![BackgroundObservation::global(RuntimeObservation {
+                    source: RuntimeObservationSource::Cloud {
+                        provider: "test".to_string(),
+                    },
+                    event: RuntimeEvent::NetworkAvailabilityChanged { available: true },
+                })],
+            })
+            .expect("background tick");
+
+        assert!(matches!(
+            result.tasks[0].outcome,
+            BackgroundTaskTickOutcome::Stepped {
+                decision: LoopDecision {
+                    next_action: NextAction::ContinueLocalWork { .. },
+                    ..
+                }
+            }
+        ));
+        let task = store.load("task-network").expect("load task");
+        assert!(task.state.blocker.is_none());
+        assert_eq!(task.state.phase, TaskPhase::Checkpointed);
+    }
+
+    #[test]
+    fn background_runner_closes_task_scoped_foreground_action() {
+        let (store, runner) = test_background_runner();
+        store
+            .create(TaskState::new_background_task(
+                "task-open-launcher",
+                "open launcher",
+            ))
+            .expect("create task");
+        AgentLoop::new(store.clone())
+            .step(LoopStepRequest {
+                task_id: "task-open-launcher".to_string(),
+                observations: vec![],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.google.android.apps.nexuslauncher".to_string(),
+                    }),
+                    reason: "open launcher".to_string(),
+                    expected_observation: Some("launcher is foreground".to_string()),
+                    proposal_id: None,
+                }),
+            })
+            .expect("accept action");
+        store
+            .transition_state("task-open-launcher", begin_current_action_execution)
+            .expect("begin action");
+
+        let result = runner
+            .tick(BackgroundTickRequest {
+                tick_id: 3,
+                observations: vec![BackgroundObservation::for_task(
+                    "task-open-launcher",
+                    android_foreground("com.google.android.apps.nexuslauncher"),
+                )],
+            })
+            .expect("background tick");
+
+        assert!(matches!(
+            result.tasks[0].outcome,
+            BackgroundTaskTickOutcome::Stepped {
+                decision: LoopDecision {
+                    next_action: NextAction::ContinueLocalWork { .. },
+                    ..
+                }
+            }
+        ));
+        let task = store.load("task-open-launcher").expect("load task");
+        let action = task.state.current_action.expect("current action");
+        assert_eq!(action.status, AgentActionStatus::Observed);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Committed);
+    }
+
+    #[test]
+    fn background_runner_does_not_apply_global_foreground_to_actions() {
+        let (store, runner) = test_background_runner();
+        store
+            .create(TaskState::new_background_task(
+                "task-open-launcher",
+                "open launcher",
+            ))
+            .expect("create task");
+        AgentLoop::new(store.clone())
+            .step(LoopStepRequest {
+                task_id: "task-open-launcher".to_string(),
+                observations: vec![],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.google.android.apps.nexuslauncher".to_string(),
+                    }),
+                    reason: "open launcher".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                }),
+            })
+            .expect("accept action");
+        store
+            .transition_state("task-open-launcher", begin_current_action_execution)
+            .expect("begin action");
+
+        runner
+            .tick(BackgroundTickRequest {
+                tick_id: 4,
+                observations: vec![BackgroundObservation::global(android_foreground(
+                    "com.google.android.apps.nexuslauncher",
+                ))],
+            })
+            .expect("background tick");
+
+        let task = store.load("task-open-launcher").expect("load task");
+        let action = task.state.current_action.expect("current action");
+        assert_eq!(action.status, AgentActionStatus::Executing);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Prepared);
+    }
+
+    #[test]
+    fn background_runner_does_not_close_or_block_accepted_action_from_foreground_sample() {
+        let (store, runner) = test_background_runner();
+        store
+            .create(TaskState::new_background_task(
+                "task-open-settings",
+                "open settings",
+            ))
+            .expect("create task");
+        AgentLoop::new(store.clone())
+            .step(LoopStepRequest {
+                task_id: "task-open-settings".to_string(),
+                observations: vec![],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.android.settings".to_string(),
+                    }),
+                    reason: "open settings".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                }),
+            })
+            .expect("accept action");
+
+        runner
+            .tick(BackgroundTickRequest {
+                tick_id: 5,
+                observations: vec![BackgroundObservation::for_task(
+                    "task-open-settings",
+                    android_foreground("com.google.android.apps.nexuslauncher"),
+                )],
+            })
+            .expect("background tick");
+
+        let task = store.load("task-open-settings").expect("load task");
+        assert!(task.state.blocker.is_none());
+        let action = task.state.current_action.expect("current action");
+        assert_eq!(action.status, AgentActionStatus::Accepted);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Planned);
     }
 
     #[test]
