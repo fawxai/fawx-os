@@ -10,11 +10,12 @@ use fawx_android_adapter::{
     foreground_observation,
 };
 use fawx_harness::{
-    ForegroundPolicyDecision, ForegroundUnavailableReason, RuntimeEvent, RuntimeObservation,
-    RuntimeObservationSource, TaskState, TaskTransitionError, apply_foreground_policy,
-    record_action_checkpoint, require_foreground_attention,
+    ForegroundPolicyDecision, ForegroundUnavailableReason, ModelActivityKind,
+    ModelActivityProposal, RuntimeEvent, RuntimeObservation, RuntimeObservationSource, TaskState,
+    TaskTransitionError, apply_foreground_policy, record_action_checkpoint,
+    require_foreground_attention,
 };
-use fawx_kernel::{ActionBoundary, ActionBoundaryState};
+use fawx_kernel::{ActionBoundary, ActionBoundaryState, AgentActivityTarget};
 use fawx_task_store::{StoredTask, TaskStore, default_task_store_path};
 
 fn main() -> ExitCode {
@@ -110,12 +111,16 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
 struct AgentStepOptions {
     expected_foreground_package: Option<String>,
     sample_foreground: bool,
+    model_activity: Option<ModelActivityProposal>,
 }
 
 impl AgentStepOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut expected_foreground_package = None;
         let mut sample_foreground = false;
+        let mut activity_kind = None;
+        let mut activity_description = None;
+        let mut activity_target = None;
         let mut index = 0;
 
         while index < args.len() {
@@ -136,13 +141,40 @@ impl AgentStepOptions {
                     sample_foreground = true;
                     index += 1;
                 }
+                "--activity-kind" => {
+                    let value = non_flag_value(args, index, "--activity-kind")?;
+                    activity_kind = Some(parse_activity_kind(value)?);
+                    index += 2;
+                }
+                "--activity-description" => {
+                    let value = non_flag_value(args, index, "--activity-description")?;
+                    activity_description = Some(value.to_string());
+                    index += 2;
+                }
+                "--activity-target" => {
+                    let value = non_flag_value(args, index, "--activity-target")?;
+                    activity_target = Some(parse_activity_target(value)?);
+                    index += 2;
+                }
                 value => return Err(format!("unknown agent-step option: {value}")),
             }
         }
 
+        let model_activity = match (activity_kind, activity_description) {
+            (Some(kind), Some(description)) => Some(ModelActivityProposal {
+                kind,
+                target: activity_target,
+                description,
+            }),
+            (None, None) if activity_target.is_none() => None,
+            (Some(_), None) => return Err("missing --activity-description".to_string()),
+            (None, Some(_)) | (None, None) => return Err("missing --activity-kind".to_string()),
+        };
+
         Ok(Self {
             expected_foreground_package,
             sample_foreground,
+            model_activity,
         })
     }
 }
@@ -163,6 +195,7 @@ fn run_agent_step(
         task_id: task_id.to_string(),
         observations,
         expected_foreground_package: options.expected_foreground_package,
+        model_activity: options.model_activity,
     })?;
 
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -409,6 +442,67 @@ fn optional_u64(args: &[String], index: usize, default: u64) -> Result<u64, Stri
         .unwrap_or(Ok(default))
 }
 
+fn non_flag_value<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a str, String> {
+    let value = args
+        .get(index + 1)
+        .ok_or_else(|| format!("missing {option} value"))?;
+    if value.starts_with("--") {
+        return Err(format!("missing {option} value before option {value}"));
+    }
+    Ok(value)
+}
+
+fn parse_activity_kind(value: &str) -> Result<ModelActivityKind, String> {
+    match value {
+        "observing" => Ok(ModelActivityKind::Observing),
+        "planning" => Ok(ModelActivityKind::Planning),
+        "executing" => Ok(ModelActivityKind::Executing),
+        "verifying" => Ok(ModelActivityKind::Verifying),
+        "summarizing" => Ok(ModelActivityKind::Summarizing),
+        "waiting" => Err("activity kind 'waiting' is reserved for typed blockers".to_string()),
+        _ => Err(format!("unknown activity kind: {value}")),
+    }
+}
+
+fn parse_activity_target(value: &str) -> Result<AgentActivityTarget, String> {
+    if value == "task" {
+        return Ok(AgentActivityTarget::Task);
+    }
+    if value == "network" {
+        return Ok(AgentActivityTarget::Network);
+    }
+    if value == "unknown" {
+        return Ok(AgentActivityTarget::Unknown);
+    }
+    let Some((kind, payload)) = value.split_once(':') else {
+        return Err(format!("invalid activity target: {value}"));
+    };
+    if payload.is_empty() {
+        return Err(format!("empty activity target payload: {value}"));
+    }
+    match kind {
+        "android-package" => Ok(AgentActivityTarget::AndroidPackage {
+            package_name: payload.to_string(),
+        }),
+        "url" => Ok(AgentActivityTarget::Url {
+            url: payload.to_string(),
+        }),
+        "file" => Ok(AgentActivityTarget::File {
+            path: payload.to_string(),
+        }),
+        "service" => Ok(AgentActivityTarget::Service {
+            name: payload.to_string(),
+        }),
+        "contact" => Ok(AgentActivityTarget::Contact {
+            label: payload.to_string(),
+        }),
+        "runtime-action" => Ok(AgentActivityTarget::RuntimeAction {
+            name: payload.to_string(),
+        }),
+        _ => Err(format!("unknown activity target kind: {kind}")),
+    }
+}
+
 fn print_usage() {
     eprintln!("usage:");
     eprintln!("  fawx-terminal-runner create <task-id> <objective>");
@@ -419,6 +513,8 @@ fn print_usage() {
     eprintln!(
         "  fawx-terminal-runner agent-step <task-id> [--expected-foreground <package>] [--sample-foreground]"
     );
+    eprintln!("    [--activity-kind observing|planning|executing|verifying|summarizing]");
+    eprintln!("    [--activity-description <description>] [--activity-target <target>]");
     eprintln!("  fawx-terminal-runner heartbeat <task-id> [count] [interval-ms] [--foreground]");
     eprintln!(
         "  fawx-terminal-runner watch-foreground <task-id> <expected-package> [count] [interval-ms]"
@@ -469,6 +565,53 @@ mod tests {
             Some("com.android.settings".to_string())
         );
         assert!(options.sample_foreground);
+        assert!(options.model_activity.is_none());
+    }
+
+    #[test]
+    fn agent_step_options_parse_model_activity_contract() {
+        let options = AgentStepOptions::parse(&[
+            "--activity-kind".to_string(),
+            "observing".to_string(),
+            "--activity-description".to_string(),
+            "checking settings state".to_string(),
+            "--activity-target".to_string(),
+            "android-package:com.android.settings".to_string(),
+        ])
+        .expect("parse model activity");
+
+        let activity = options.model_activity.expect("model activity");
+        assert_eq!(activity.kind, ModelActivityKind::Observing);
+        assert_eq!(activity.description, "checking settings state");
+        assert!(matches!(
+            activity.target,
+            Some(AgentActivityTarget::AndroidPackage { package_name })
+                if package_name == "com.android.settings"
+        ));
+    }
+
+    #[test]
+    fn agent_step_options_reject_activity_without_kind() {
+        let error = AgentStepOptions::parse(&[
+            "--activity-description".to_string(),
+            "checking settings state".to_string(),
+        ])
+        .expect_err("description without kind should fail");
+
+        assert!(error.contains("missing --activity-kind"));
+    }
+
+    #[test]
+    fn agent_step_options_reject_waiting_activity_kind() {
+        let error = AgentStepOptions::parse(&[
+            "--activity-kind".to_string(),
+            "waiting".to_string(),
+            "--activity-description".to_string(),
+            "waiting maybe".to_string(),
+        ])
+        .expect_err("waiting kind should fail");
+
+        assert!(error.contains("reserved for typed blockers"));
     }
 
     #[test]
