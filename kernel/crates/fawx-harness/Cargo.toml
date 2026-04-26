@@ -1,0 +1,15 @@
+[package]
+name = "fawx-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fawx-kernel = { path = "../fawx-kernel" }
+serde.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"

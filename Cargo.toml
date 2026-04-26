@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "kernel/crates/fawx-kernel",
+    "kernel/crates/fawx-harness",
+    "kernel/crates/fawx-task-store",
+    "cloud/crates/fawx-cloud-contracts",
+    "browser/crates/fawx-browser-contracts",
+    "device/crates/fawx-android-adapter",
+    "device/crates/fawx-android-probe",
+    "device/crates/fawx-terminal-runner",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+version = "0.1.0"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
