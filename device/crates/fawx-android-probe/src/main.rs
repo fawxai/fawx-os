@@ -2,7 +2,8 @@ use std::error::Error;
 use std::process::ExitCode;
 
 use fawx_android_adapter::{
-    AndroidEvent, AndroidObservation, AndroidSubstrate, foreground_observation, run_command,
+    AndroidEvent, AndroidObservation, AndroidReconCommand, AndroidSubstrate,
+    foreground_observation, run_recon_command,
 };
 use serde::Serialize;
 
@@ -20,9 +21,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     let report = ProbeReport {
         substrate: AndroidSubstrate::ReconRootedStock,
         observations: vec![
-            command_observation("whoami", &["whoami"]),
-            command_observation("id", &["id"]),
-            command_observation("uname", &["uname", "-a"]),
+            command_observation("whoami", AndroidReconCommand::Whoami),
+            command_observation("id", AndroidReconCommand::Id),
+            command_observation("uname", AndroidReconCommand::Uname),
             root_observation(),
             foreground_probe_observation(),
         ],
@@ -46,8 +47,8 @@ struct ProbeObservation {
     android_observation: Option<AndroidObservation>,
 }
 
-fn command_observation(name: &str, argv: &[&str]) -> ProbeObservation {
-    match run_command(argv) {
+fn command_observation(name: &str, command: AndroidReconCommand) -> ProbeObservation {
+    match run_recon_command(command) {
         Ok(output) => ProbeObservation {
             name: name.to_string(),
             ok: true,
@@ -64,7 +65,7 @@ fn command_observation(name: &str, argv: &[&str]) -> ProbeObservation {
 }
 
 fn root_observation() -> ProbeObservation {
-    let rooted = run_command(&["su", "-c", "id"]).is_ok();
+    let rooted = run_recon_command(AndroidReconCommand::RootCheck).is_ok();
 
     ProbeObservation {
         name: "root".to_string(),

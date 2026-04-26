@@ -17,6 +17,172 @@ pub enum AndroidSubstrate {
     AospPlatform,
 }
 
+/// The durable Android capability categories the runtime can reason about.
+/// These are adapter facts, not permission grants. The kernel still decides
+/// whether a task may use an available capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AndroidCapability {
+    ObserveForegroundApp,
+    LaunchApp,
+    ControlForegroundApp,
+    ReadNotifications,
+    PostNotifications,
+    PlaceCall,
+    SendMessage,
+    ReadSharedStorage,
+    WriteSharedStorage,
+    NetworkAccess,
+    BackgroundExecution,
+    InstallPackages,
+    SystemSettings,
+    RootShell,
+}
+
+impl AndroidCapability {
+    pub const ALL: &'static [Self] = &[
+        Self::ObserveForegroundApp,
+        Self::LaunchApp,
+        Self::ControlForegroundApp,
+        Self::ReadNotifications,
+        Self::PostNotifications,
+        Self::PlaceCall,
+        Self::SendMessage,
+        Self::ReadSharedStorage,
+        Self::WriteSharedStorage,
+        Self::NetworkAccess,
+        Self::BackgroundExecution,
+        Self::InstallPackages,
+        Self::SystemSettings,
+        Self::RootShell,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AndroidCapabilityStatus {
+    Available,
+    Limited,
+    RequiresAospPrivilege,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AndroidCapabilityEntry {
+    pub capability: AndroidCapability,
+    pub rooted_stock: AndroidCapabilityStatus,
+    pub aosp_platform: AndroidCapabilityStatus,
+    pub note: &'static str,
+}
+
+pub const ANDROID_CAPABILITY_MAP: &[AndroidCapabilityEntry] = &[
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::ObserveForegroundApp,
+        rooted_stock: AndroidCapabilityStatus::Available,
+        aosp_platform: AndroidCapabilityStatus::Available,
+        note: "Recon can observe foreground focus through dumpsys; AOSP should expose a stable platform event.",
+    },
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::LaunchApp,
+        rooted_stock: AndroidCapabilityStatus::Limited,
+        aosp_platform: AndroidCapabilityStatus::Available,
+        note: "Recon can use activity-manager style shell commands, but reliable launch/resume belongs in a privileged adapter.",
+    },
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::ControlForegroundApp,
+        rooted_stock: AndroidCapabilityStatus::Limited,
+        aosp_platform: AndroidCapabilityStatus::Available,
+        note: "Recon can probe input/UI automation, but durable control needs accessibility, shell, or framework integration.",
+    },
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::ReadNotifications,
+        rooted_stock: AndroidCapabilityStatus::Limited,
+        aosp_platform: AndroidCapabilityStatus::Available,
+        note: "Recon may inspect notification state opportunistically; production needs a notification listener/system hook.",
+    },
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::PostNotifications,
+        rooted_stock: AndroidCapabilityStatus::RequiresAospPrivilege,
+        aosp_platform: AndroidCapabilityStatus::Available,
+        note: "Posting user-visible OS notifications should be a platform-owned capability, not a shell trick.",
+    },
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::PlaceCall,
+        rooted_stock: AndroidCapabilityStatus::RequiresAospPrivilege,
+        aosp_platform: AndroidCapabilityStatus::Available,
+        note: "Telephony side effects require explicit user/kernel authority and privileged platform integration.",
+    },
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::SendMessage,
+        rooted_stock: AndroidCapabilityStatus::RequiresAospPrivilege,
+        aosp_platform: AndroidCapabilityStatus::Available,
+        note: "Messaging side effects require explicit user/kernel authority and privileged platform integration.",
+    },
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::ReadSharedStorage,
+        rooted_stock: AndroidCapabilityStatus::Limited,
+        aosp_platform: AndroidCapabilityStatus::Available,
+        note: "Recon can read shell-accessible paths; AOSP should expose scoped storage through typed policy.",
+    },
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::WriteSharedStorage,
+        rooted_stock: AndroidCapabilityStatus::Limited,
+        aosp_platform: AndroidCapabilityStatus::Available,
+        note: "Recon writes are path-limited and risky; AOSP should mediate writes through grants.",
+    },
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::NetworkAccess,
+        rooted_stock: AndroidCapabilityStatus::Available,
+        aosp_platform: AndroidCapabilityStatus::Available,
+        note: "Network access is available but must still be grant-gated by task policy.",
+    },
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::BackgroundExecution,
+        rooted_stock: AndroidCapabilityStatus::Limited,
+        aosp_platform: AndroidCapabilityStatus::Available,
+        note: "Recon can run detached shell processes; production requires supervised platform services.",
+    },
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::InstallPackages,
+        rooted_stock: AndroidCapabilityStatus::Limited,
+        aosp_platform: AndroidCapabilityStatus::Available,
+        note: "Recon package install is device-policy dependent; production requires package-manager authority.",
+    },
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::SystemSettings,
+        rooted_stock: AndroidCapabilityStatus::Limited,
+        aosp_platform: AndroidCapabilityStatus::Available,
+        note: "Recon can inspect or poke some settings; production needs typed framework APIs.",
+    },
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::RootShell,
+        rooted_stock: AndroidCapabilityStatus::Limited,
+        aosp_platform: AndroidCapabilityStatus::Unavailable,
+        note: "Root shell is a recon escape hatch, not a production OS primitive.",
+    },
+];
+
+pub fn android_capability_map() -> &'static [AndroidCapabilityEntry] {
+    ANDROID_CAPABILITY_MAP
+}
+
+pub fn android_capability_entry(
+    capability: AndroidCapability,
+) -> Option<&'static AndroidCapabilityEntry> {
+    ANDROID_CAPABILITY_MAP
+        .iter()
+        .find(|entry| entry.capability == capability)
+}
+
+pub fn android_capability_status(
+    substrate: AndroidSubstrate,
+    capability: AndroidCapability,
+) -> Option<AndroidCapabilityStatus> {
+    let entry = android_capability_entry(capability)?;
+    Some(match substrate {
+        AndroidSubstrate::ReconRootedStock => entry.rooted_stock,
+        AndroidSubstrate::AospPlatform => entry.aosp_platform,
+    })
+}
+
 /// Observations flowing upward from Android into the Fawx OS runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AndroidEvent {
@@ -58,12 +224,21 @@ pub enum AndroidForegroundUnavailableReason {
 /// Commands flowing downward from the runtime into the Android adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AndroidCommand {
-    AcquireForeground { target: String },
+    AcquireForeground {
+        target: String,
+    },
     ReleaseForeground,
-    ObserveNotifications { source: String },
+    ObserveNotifications {
+        source: String,
+    },
     QueryForegroundState,
-    ResumeAppSurface { package_name: String },
-    PerformRootedAction { action: String, target: String },
+    ResumeAppSurface {
+        package_name: String,
+    },
+    PerformRootedAction {
+        capability: AndroidCapability,
+        target: String,
+    },
 }
 
 /// A typed Android observation with explicit substrate provenance.
@@ -80,12 +255,65 @@ pub struct AndroidActionRequest {
     pub command: AndroidCommand,
 }
 
+impl AndroidActionRequest {
+    pub fn required_capability(&self) -> Option<AndroidCapability> {
+        self.command.required_capability()
+    }
+
+    pub fn capability_status(&self) -> Option<AndroidCapabilityStatus> {
+        android_capability_status(self.substrate, self.required_capability()?)
+    }
+}
+
+impl AndroidCommand {
+    pub fn required_capability(&self) -> Option<AndroidCapability> {
+        match self {
+            Self::AcquireForeground { .. } | Self::ResumeAppSurface { .. } => {
+                Some(AndroidCapability::LaunchApp)
+            }
+            Self::ReleaseForeground | Self::QueryForegroundState => {
+                Some(AndroidCapability::ObserveForegroundApp)
+            }
+            Self::ObserveNotifications { .. } => Some(AndroidCapability::ReadNotifications),
+            Self::PerformRootedAction { capability, .. } => Some(*capability),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
     pub stdout: String,
     pub stderr: String,
     pub status: String,
     pub success: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AndroidReconCommand {
+    Whoami,
+    Id,
+    Uname,
+    RootCheck,
+}
+
+impl AndroidReconCommand {
+    fn argv(self) -> &'static [&'static str] {
+        match self {
+            Self::Whoami => &["whoami"],
+            Self::Id => &["id"],
+            Self::Uname => &["uname", "-a"],
+            Self::RootCheck => &["su", "-c", "id"],
+        }
+    }
+}
+
+pub fn run_recon_command(command: AndroidReconCommand) -> Result<String, String> {
+    let output = run_command_output(command.argv())?;
+    if output.success {
+        Ok(output.stdout.trim().to_string())
+    } else {
+        Err(output.failure_summary())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,16 +441,7 @@ pub fn foreground_focus_command() -> [&'static str; 2] {
     ["dumpsys", "window"]
 }
 
-pub fn run_command(argv: &[&str]) -> Result<String, String> {
-    let output = run_command_output(argv)?;
-    if output.success {
-        Ok(output.stdout.trim().to_string())
-    } else {
-        Err(output.failure_summary())
-    }
-}
-
-pub fn run_command_output(argv: &[&str]) -> Result<CommandOutput, String> {
+fn run_command_output(argv: &[&str]) -> Result<CommandOutput, String> {
     let Some((program, args)) = argv.split_first() else {
         return Err("empty command".to_string());
     };
@@ -315,6 +534,14 @@ mod tests {
             AndroidCommand::AcquireForeground { .. }
         ));
         assert_eq!(request.substrate, AndroidSubstrate::AospPlatform);
+        assert_eq!(
+            request.required_capability(),
+            Some(AndroidCapability::LaunchApp)
+        );
+        assert_eq!(
+            request.capability_status(),
+            Some(AndroidCapabilityStatus::Available)
+        );
     }
 
     #[test]
@@ -325,6 +552,99 @@ mod tests {
         };
 
         assert_eq!(observation.substrate, AndroidSubstrate::ReconRootedStock);
+    }
+
+    #[test]
+    fn capability_map_keeps_recon_and_aosp_boundaries_explicit() {
+        let foreground = android_capability_entry(AndroidCapability::ObserveForegroundApp)
+            .expect("foreground capability");
+        assert_eq!(foreground.rooted_stock, AndroidCapabilityStatus::Available);
+        assert_eq!(foreground.aosp_platform, AndroidCapabilityStatus::Available);
+
+        let place_call =
+            android_capability_entry(AndroidCapability::PlaceCall).expect("call capability");
+        assert_eq!(
+            place_call.rooted_stock,
+            AndroidCapabilityStatus::RequiresAospPrivilege
+        );
+        assert_eq!(place_call.aosp_platform, AndroidCapabilityStatus::Available);
+
+        let root_shell =
+            android_capability_entry(AndroidCapability::RootShell).expect("root capability");
+        assert_eq!(root_shell.rooted_stock, AndroidCapabilityStatus::Limited);
+        assert_eq!(
+            root_shell.aosp_platform,
+            AndroidCapabilityStatus::Unavailable
+        );
+    }
+
+    #[test]
+    fn capability_map_has_unique_entries() {
+        let map = android_capability_map();
+        assert!(!map.is_empty());
+        for (index, entry) in map.iter().enumerate() {
+            assert!(
+                map.iter()
+                    .skip(index + 1)
+                    .all(|other| other.capability != entry.capability),
+                "duplicate capability: {:?}",
+                entry.capability
+            );
+            assert!(!entry.note.trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn capability_map_covers_every_android_capability_variant() {
+        assert_eq!(android_capability_map().len(), AndroidCapability::ALL.len());
+        for capability in AndroidCapability::ALL {
+            assert!(
+                android_capability_entry(*capability).is_some(),
+                "missing capability map entry for {capability:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_all_list_exercises_every_variant_with_exhaustive_match() {
+        for capability in AndroidCapability::ALL {
+            match capability {
+                AndroidCapability::ObserveForegroundApp
+                | AndroidCapability::LaunchApp
+                | AndroidCapability::ControlForegroundApp
+                | AndroidCapability::ReadNotifications
+                | AndroidCapability::PostNotifications
+                | AndroidCapability::PlaceCall
+                | AndroidCapability::SendMessage
+                | AndroidCapability::ReadSharedStorage
+                | AndroidCapability::WriteSharedStorage
+                | AndroidCapability::NetworkAccess
+                | AndroidCapability::BackgroundExecution
+                | AndroidCapability::InstallPackages
+                | AndroidCapability::SystemSettings
+                | AndroidCapability::RootShell => {}
+            }
+        }
+    }
+
+    #[test]
+    fn rooted_actions_are_typed_capability_requests() {
+        let request = AndroidActionRequest {
+            substrate: AndroidSubstrate::ReconRootedStock,
+            command: AndroidCommand::PerformRootedAction {
+                capability: AndroidCapability::PlaceCall,
+                target: "tel:+15555550100".to_string(),
+            },
+        };
+
+        assert_eq!(
+            request.required_capability(),
+            Some(AndroidCapability::PlaceCall)
+        );
+        assert_eq!(
+            request.capability_status(),
+            Some(AndroidCapabilityStatus::RequiresAospPrivilege)
+        );
     }
 
     #[test]

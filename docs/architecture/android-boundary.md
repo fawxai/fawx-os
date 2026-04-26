@@ -191,6 +191,29 @@ The runtime must never assume that "root exists" means "all actions are acceptab
 
 Root broadens the action surface. It does not weaken the kernel.
 
+## Android Capability Map
+
+The adapter owns substrate facts. The kernel owns permission decisions.
+
+This table is mirrored as typed data in `fawx-android-adapter` so tests and runtime code can depend on the same boundary the docs describe.
+
+| Capability | Rooted stock Android | AOSP/system privileges | Contract note |
+| --- | --- | --- | --- |
+| Observe foreground app | Available | Available | Recon can use `dumpsys window`; AOSP should expose stable platform events. |
+| Launch app | Limited | Available | Recon can probe activity-manager commands; reliable launch/resume belongs in a privileged adapter. |
+| Control foreground app | Limited | Available | Recon UI control is fragile; durable control needs accessibility, shell, or framework integration. |
+| Read notifications | Limited | Available | Production needs notification listener or system hook semantics. |
+| Post notifications | Requires AOSP privilege | Available | User-visible OS notifications are platform actions, not shell strings. |
+| Place call | Requires AOSP privilege | Available | Telephony side effects require explicit kernel/user authority. |
+| Send message | Requires AOSP privilege | Available | Messaging side effects require explicit kernel/user authority. |
+| Read shared storage | Limited | Available | Recon can read shell-accessible paths; production needs scoped storage policy. |
+| Write shared storage | Limited | Available | Recon writes are path-limited and risky; AOSP should mediate writes through grants. |
+| Network access | Available | Available | Available does not mean ungated; task policy still grants or denies. |
+| Background execution | Limited | Available | Recon detached shell processes are useful evidence, not the final supervisor model. |
+| Install packages | Limited | Available | Package install depends on device policy until we own the package-manager boundary. |
+| System settings | Limited | Available | Recon can inspect or poke some settings; production needs typed framework APIs. |
+| Root shell | Limited | Unavailable | Root shell is a recon escape hatch, not a production OS primitive. |
+
 ## Minimum First-Implementation Contract
 
 For the first Android boundary implementation, we need:
