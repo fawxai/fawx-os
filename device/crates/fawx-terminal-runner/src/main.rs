@@ -4,7 +4,9 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
-use fawx_agent_loop::{AgentLoop, LoopStepRequest};
+use fawx_agent_loop::{
+    AgentLoop, BackgroundObservation, BackgroundRunner, BackgroundTickRequest, LoopStepRequest,
+};
 use fawx_android_adapter::{
     AndroidEvent, AndroidForegroundUnavailableReason, AndroidObservation, AndroidSubstrate,
     foreground_observation,
@@ -15,7 +17,7 @@ use fawx_harness::{
     RuntimeObservationSource, TaskState, TaskTransitionError, apply_foreground_policy,
     begin_current_action_execution, record_action_checkpoint, require_foreground_attention,
 };
-use fawx_kernel::{ActionBoundary, ActionBoundaryState, AgentActivityTarget};
+use fawx_kernel::{ActionBoundary, ActionBoundaryState, AgentActionStatus, AgentActivityTarget};
 use fawx_task_store::{StoredTask, TaskStore, default_task_store_path};
 
 fn main() -> ExitCode {
@@ -75,6 +77,10 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             let options = AgentStepOptions::parse(&args[2..])?;
             run_agent_step(&store, task_id, options)?;
         }
+        "background-tick" => {
+            let options = BackgroundTickOptions::parse(&args[1..])?;
+            run_background_tick(&store, options)?;
+        }
         "begin-action" => {
             let task_id = required_arg(&args, 1, "task id")?;
             let task = store.transition_state(task_id, begin_current_action_execution)?;
@@ -118,6 +124,67 @@ struct AgentStepOptions {
     sample_foreground: bool,
     model_activity: Option<ModelActivityProposal>,
     model_action: Option<ModelActionProposal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BackgroundTickOptions {
+    count: usize,
+    interval: Duration,
+    sample_foreground: bool,
+    foreground_task: Option<String>,
+}
+
+impl BackgroundTickOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut count = None;
+        let mut interval_ms = None;
+        let mut sample_foreground = false;
+        let mut foreground_task = None;
+        let mut index = 0;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--foreground" => {
+                    sample_foreground = true;
+                    index += 1;
+                }
+                "--foreground-task" => {
+                    let task_id = non_flag_value(args, index, "--foreground-task")?;
+                    foreground_task = Some(task_id.to_string());
+                    sample_foreground = true;
+                    index += 2;
+                }
+                value if value.starts_with("--") => {
+                    return Err(format!("unknown background-tick option: {value}"));
+                }
+                value => {
+                    if count.is_none() {
+                        count = Some(
+                            value
+                                .parse()
+                                .map_err(|error| format!("invalid integer '{value}': {error}"))?,
+                        );
+                    } else if interval_ms.is_none() {
+                        interval_ms = Some(
+                            value
+                                .parse()
+                                .map_err(|error| format!("invalid integer '{value}': {error}"))?,
+                        );
+                    } else {
+                        return Err(format!("unexpected background-tick argument: {value}"));
+                    }
+                    index += 1;
+                }
+            }
+        }
+
+        Ok(Self {
+            count: count.unwrap_or(1),
+            interval: Duration::from_millis(interval_ms.unwrap_or(1000)),
+            sample_foreground,
+            foreground_task,
+        })
+    }
 }
 
 impl AgentStepOptions {
@@ -244,6 +311,96 @@ fn run_agent_step(
 
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+fn run_background_tick(
+    store: &TaskStore,
+    options: BackgroundTickOptions,
+) -> Result<(), Box<dyn Error>> {
+    let runner = BackgroundRunner::new(store.clone());
+    for tick in 1..=options.count {
+        let observations = if options.sample_foreground {
+            let tasks = store.list()?;
+            let android_observation = foreground_observation(AndroidSubstrate::ReconRootedStock);
+            scoped_foreground_observations(
+                &tasks,
+                &android_observation,
+                options.foreground_task.as_deref(),
+            )?
+        } else {
+            vec![]
+        };
+        let result = runner.tick(BackgroundTickRequest {
+            tick_id: tick as u64,
+            observations,
+        })?;
+
+        println!("{}", serde_json::to_string_pretty(&result)?);
+
+        if tick < options.count {
+            thread::sleep(options.interval);
+        }
+    }
+
+    Ok(())
+}
+
+fn scoped_foreground_observations(
+    tasks: &[StoredTask],
+    android_observation: &AndroidObservation,
+    explicit_task_id: Option<&str>,
+) -> Result<Vec<BackgroundObservation>, String> {
+    let runtime_observation = runtime_observation_from_android(android_observation);
+    if let Some(task_id) = explicit_task_id {
+        if tasks.iter().any(|task| task.state.task_id == task_id) {
+            return Ok(vec![BackgroundObservation::for_task(
+                task_id.to_string(),
+                runtime_observation,
+            )]);
+        }
+        return Err(format!("unknown --foreground-task: {task_id}"));
+    }
+
+    let Some(observed_package) = foreground_package_from_runtime_observation(&runtime_observation)
+    else {
+        return Ok(vec![]);
+    };
+    let matching_task_ids = tasks
+        .iter()
+        .filter(|task| task_expects_executing_foreground_package(&task.state, observed_package))
+        .map(|task| task.state.task_id.as_str())
+        .collect::<Vec<_>>();
+
+    match matching_task_ids.as_slice() {
+        [] => Ok(vec![]),
+        [task_id] => Ok(vec![BackgroundObservation::for_task(
+            (*task_id).to_string(),
+            runtime_observation,
+        )]),
+        task_ids => Err(format!(
+            "ambiguous foreground observation for package {observed_package}; matching tasks: {}",
+            task_ids.join(", ")
+        )),
+    }
+}
+
+fn foreground_package_from_runtime_observation(observation: &RuntimeObservation) -> Option<&str> {
+    match &observation.event {
+        RuntimeEvent::ForegroundAppChanged { package_name, .. } => Some(package_name),
+        _ => None,
+    }
+}
+
+fn task_expects_executing_foreground_package(state: &TaskState, observed_package: &str) -> bool {
+    state.current_action.as_ref().is_some_and(|action| {
+        action.status == AgentActionStatus::Executing
+            && action.boundary.state == ActionBoundaryState::Prepared
+            && matches!(
+                action.target.as_ref(),
+                Some(AgentActivityTarget::AndroidPackage { package_name })
+                    if package_name == observed_package
+            )
+    })
 }
 
 fn manual_checkpoint_state(
@@ -579,6 +736,9 @@ fn print_usage() {
     );
     eprintln!("    [--action-reason <reason>] [--action-target <target>]");
     eprintln!("    [--expected-observation <observation>]");
+    eprintln!(
+        "  fawx-terminal-runner background-tick [count] [interval-ms] [--foreground] [--foreground-task <task-id>]"
+    );
     eprintln!("  fawx-terminal-runner begin-action <task-id>");
     eprintln!("  fawx-terminal-runner heartbeat <task-id> [count] [interval-ms] [--foreground]");
     eprintln!(
@@ -591,6 +751,60 @@ mod tests {
     use super::*;
     use fawx_harness::TaskPhase;
     use fawx_kernel::TaskBlocker;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_store() -> TaskStore {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        TaskStore::new(std::env::temp_dir().join(format!(
+            "fawx-terminal-runner-test-{}-{id}",
+            std::process::id()
+        )))
+    }
+
+    fn foreground(package_name: &str) -> AndroidObservation {
+        AndroidObservation {
+            substrate: AndroidSubstrate::ReconRootedStock,
+            event: AndroidEvent::ForegroundAppChanged {
+                package_name: package_name.to_string(),
+                activity_name: Some(".ExampleActivity".to_string()),
+            },
+        }
+    }
+
+    fn create_open_app_action(
+        store: &TaskStore,
+        task_id: &str,
+        package_name: &str,
+        begin_execution: bool,
+    ) {
+        store
+            .create(TaskState::new_background_task(task_id, "open app"))
+            .expect("create task");
+        AgentLoop::new(store.clone())
+            .step(LoopStepRequest {
+                task_id: task_id.to_string(),
+                observations: vec![],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: package_name.to_string(),
+                    }),
+                    reason: format!("open {package_name}"),
+                    expected_observation: None,
+                    proposal_id: None,
+                }),
+            })
+            .expect("accept action");
+        if begin_execution {
+            store
+                .transition_state(task_id, begin_current_action_execution)
+                .expect("begin action");
+        }
+    }
 
     #[test]
     fn manual_checkpoint_uses_harness_blocker_guard() {
@@ -632,6 +846,82 @@ mod tests {
         assert!(options.sample_foreground);
         assert!(options.model_activity.is_none());
         assert!(options.model_action.is_none());
+    }
+
+    #[test]
+    fn background_tick_options_parse_foreground_task_owner() {
+        let options = BackgroundTickOptions::parse(&[
+            "--foreground".to_string(),
+            "--foreground-task".to_string(),
+            "task-1".to_string(),
+            "2".to_string(),
+            "50".to_string(),
+        ])
+        .expect("parse background tick options");
+
+        assert_eq!(options.count, 2);
+        assert_eq!(options.interval, Duration::from_millis(50));
+        assert!(options.sample_foreground);
+        assert_eq!(options.foreground_task.as_deref(), Some("task-1"));
+    }
+
+    #[test]
+    fn foreground_scoping_routes_to_single_executing_matching_action() {
+        let store = test_store();
+        create_open_app_action(
+            &store,
+            "task-executing-launcher",
+            "com.google.android.apps.nexuslauncher",
+            true,
+        );
+        create_open_app_action(
+            &store,
+            "task-accepted-launcher",
+            "com.google.android.apps.nexuslauncher",
+            false,
+        );
+
+        let observations = scoped_foreground_observations(
+            &store.list().expect("list tasks"),
+            &foreground("com.google.android.apps.nexuslauncher"),
+            None,
+        )
+        .expect("scope foreground");
+
+        assert_eq!(observations.len(), 1);
+        assert!(matches!(
+            observations[0].scope,
+            fawx_agent_loop::BackgroundObservationScope::Task { ref task_id }
+                if task_id == "task-executing-launcher"
+        ));
+    }
+
+    #[test]
+    fn foreground_scoping_rejects_ambiguous_executing_matching_actions() {
+        let store = test_store();
+        create_open_app_action(
+            &store,
+            "task-one",
+            "com.google.android.apps.nexuslauncher",
+            true,
+        );
+        create_open_app_action(
+            &store,
+            "task-two",
+            "com.google.android.apps.nexuslauncher",
+            true,
+        );
+
+        let error = scoped_foreground_observations(
+            &store.list().expect("list tasks"),
+            &foreground("com.google.android.apps.nexuslauncher"),
+            None,
+        )
+        .expect_err("ambiguous foreground ownership should fail");
+
+        assert!(error.contains("ambiguous foreground observation"));
+        assert!(error.contains("task-one"));
+        assert!(error.contains("task-two"));
     }
 
     #[test]

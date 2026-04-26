@@ -43,6 +43,18 @@ echo "$agent_step_output"
 [[ "$agent_step_output" == *'"kind": "Planning"'* ]]
 [[ "$agent_step_output" == *'"target": "Task"'* ]]
 [[ "$agent_step_output" == *'"source": "SystemDerived"'* ]]
+
+echo "== background runner tick =="
+"${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' create task-background-a 'prove background runner can tick task a'"
+"${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' create task-background-b 'prove background runner can tick task b'"
+background_tick_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' background-tick 1 0")"
+echo "$background_tick_output"
+[[ "$background_tick_output" == *'"tick_id": 1'* ]]
+[[ "$background_tick_output" == *'"task_id": "task-background-a"'* ]]
+[[ "$background_tick_output" == *'"task_id": "task-background-b"'* ]]
+[[ "$background_tick_output" == *'"Stepped"'* ]]
+[[ "$background_tick_output" == *'"ContinueLocalWork"'* ]]
+
 "${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' create task-agent-model-activity 'prove model declared activity contract'"
 agent_model_activity_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' agent-step task-agent-model-activity --activity-kind observing --activity-description 'checking settings state' --activity-target android-package:com.android.settings")"
 echo "$agent_model_activity_output"
@@ -73,7 +85,11 @@ agent_action_begin_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$b
 echo "$agent_action_begin_output"
 [[ "$agent_action_begin_output" == *'"status": "Executing"'* ]]
 [[ "$agent_action_begin_output" == *'"state": "Prepared"'* ]]
-agent_action_observed_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' agent-step task-agent-action-closure --expected-foreground com.google.android.apps.nexuslauncher --sample-foreground")"
+background_action_tick_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' background-tick 1 0 --foreground")"
+echo "$background_action_tick_output"
+[[ "$background_action_tick_output" == *'"task_id": "task-agent-action-closure"'* ]]
+[[ "$background_action_tick_output" == *'"Stepped"'* ]]
+agent_action_observed_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' status task-agent-action-closure")"
 echo "$agent_action_observed_output"
 [[ "$agent_action_observed_output" == *'"status": "Observed"'* ]]
 [[ "$agent_action_observed_output" == *'"state": "Committed"'* ]]
