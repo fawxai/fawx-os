@@ -53,6 +53,18 @@ echo "$agent_model_activity_output"
 [[ "$agent_model_activity_output" == *'"package_name": "com.android.settings"'* ]]
 [[ "$agent_model_activity_output" == *'"description": "checking settings state"'* ]]
 [[ "$agent_model_activity_output" == *'"source": "ModelDeclared"'* ]]
+"${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' create task-agent-model-action 'prove model action proposal contract'"
+agent_model_action_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' agent-step task-agent-model-action --action-kind open-app --action-reason 'open settings to inspect permissions' --action-target android-package:com.android.settings --expected-observation 'settings is foreground'")"
+echo "$agent_model_action_output"
+[[ "$agent_model_action_output" == *'"ContinueLocalWork"'* ]]
+[[ "$agent_model_action_output" == *'"current_action"'* ]]
+[[ "$agent_model_action_output" == *'"kind": "OpenApp"'* ]]
+[[ "$agent_model_action_output" == *'"AndroidPackage"'* ]]
+[[ "$agent_model_action_output" == *'"package_name": "com.android.settings"'* ]]
+[[ "$agent_model_action_output" == *'"reason": "open settings to inspect permissions"'* ]]
+[[ "$agent_model_action_output" == *'"expected_observation": "settings is foreground"'* ]]
+[[ "$agent_model_action_output" == *'"status": "Accepted"'* ]]
+[[ "$agent_model_action_output" == *'"id": "model-action:task-agent-model-action:1"'* ]]
 "${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' create task-agent-foreground 'prove agent loop foreground contract'"
 agent_foreground_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' agent-step task-agent-foreground --expected-foreground com.android.settings")"
 echo "$agent_foreground_output"
