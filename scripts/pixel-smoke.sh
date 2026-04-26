@@ -66,6 +66,7 @@ echo "$agent_model_activity_output"
 [[ "$agent_model_activity_output" == *'"description": "checking settings state"'* ]]
 [[ "$agent_model_activity_output" == *'"source": "ModelDeclared"'* ]]
 "${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' create task-agent-model-action 'prove model action proposal contract'"
+"${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' grant task-agent-model-action app-control android-package:com.android.settings"
 agent_model_action_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' agent-step task-agent-model-action --action-kind open-app --action-reason 'open settings to inspect permissions' --action-target android-package:com.android.settings --expected-observation 'settings is foreground'")"
 echo "$agent_model_action_output"
 [[ "$agent_model_action_output" == *'"ContinueLocalWork"'* ]]
@@ -78,6 +79,7 @@ echo "$agent_model_action_output"
 [[ "$agent_model_action_output" == *'"status": "Accepted"'* ]]
 [[ "$agent_model_action_output" == *'"id": "model-action:task-agent-model-action:1"'* ]]
 "${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' create task-agent-action-closure 'prove action execution and observation closure'"
+"${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' grant task-agent-action-closure app-control android-package:com.google.android.apps.nexuslauncher"
 agent_action_accept_output="$("${ADB[@]}" shell "FAWX_OS_TASK_DIR='$task_dir' '$bin_dir/fawx-terminal-runner' agent-step task-agent-action-closure --action-kind open-app --action-reason 'open launcher to inspect home screen' --action-target android-package:com.google.android.apps.nexuslauncher --expected-observation 'launcher is foreground'")"
 echo "$agent_action_accept_output"
 [[ "$agent_action_accept_output" == *'"status": "Accepted"'* ]]
