@@ -1,15 +1,14 @@
 [package]
-name = "fawx-harness"
+name = "fawx-agent-loop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+fawx-harness = { path = "../fawx-harness" }
 fawx-kernel = { path = "../fawx-kernel" }
+fawx-task-store = { path = "../fawx-task-store" }
 serde.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
 
 [lints]
 workspace = true

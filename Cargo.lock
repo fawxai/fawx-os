@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "fawx-agent-loop"
+version = "0.1.0"
+dependencies = [
+ "fawx-harness",
+ "fawx-kernel",
+ "fawx-task-store",
+ "serde",
+]
+
+[[package]]
 name = "fawx-android-adapter"
 version = "0.1.0"
 dependencies = [
@@ -33,6 +43,7 @@ version = "0.1.0"
 dependencies = [
  "fawx-kernel",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -55,6 +66,7 @@ dependencies = [
 name = "fawx-terminal-runner"
 version = "0.1.0"
 dependencies = [
+ "fawx-agent-loop",
  "fawx-android-adapter",
  "fawx-harness",
  "fawx-kernel",
