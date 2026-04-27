@@ -14,12 +14,14 @@ use fawx_android_adapter::{
     execute_android_action_request, foreground_observation, local_model_probe,
 };
 use fawx_harness::{
-    ForegroundPolicyDecision, ForegroundUnavailableReason, IntentCandidate, LocalModelLocality,
-    LocalModelProviderRef, ModelActionKind, ModelActionProposal, ModelActivityKind,
-    ModelActivityProposal, RuntimeEvent, RuntimeObservation, RuntimeObservationSource, TaskState,
-    TaskTransitionError, apply_foreground_policy, begin_current_action_execution,
+    CandidateAcceptanceDecision, ForegroundPolicyDecision, ForegroundUnavailableReason,
+    IntentCandidate, IntentCandidateAuthority, LocalModelLocality, LocalModelProviderRef,
+    ModelActionKind, ModelActionProposal, ModelActivityKind, ModelActivityProposal, RuntimeEvent,
+    RuntimeObservation, RuntimeObservationSource, TaskState, TaskTransitionError,
+    apply_foreground_policy, apply_owner_command_grants_for_intent_candidate,
+    begin_current_action_execution, evaluate_intent_candidate_acceptance,
     fail_current_action_execution, record_action_checkpoint, require_foreground_attention,
-    satisfy_human_handoff,
+    require_owner_approval_for_intent_candidate, satisfy_human_handoff,
 };
 use fawx_kernel::{
     ActionBoundary, ActionBoundaryState, AgentActionStatus, AgentActivityTarget,
@@ -391,19 +393,14 @@ fn run_terminal_session(store: &TaskStore) -> Result<(), Box<dyn Error>> {
                 command:
                     TerminalSessionCommand::OpenApp {
                         label,
-                        package_name,
+                        package_name: _,
                         candidate,
                     },
             }) => {
                 turn_index += 1;
-                if let Err(error) = run_session_open_app(
-                    store,
-                    turn_index,
-                    source,
-                    &label,
-                    &package_name,
-                    *candidate,
-                ) {
+                if let Err(error) =
+                    run_session_open_app(store, turn_index, source, &label, *candidate)
+                {
                     println!("blocked: {error}");
                 }
             }
@@ -432,13 +429,47 @@ fn run_session_open_app(
     turn_index: u64,
     source: TerminalSessionIntentSource,
     label: &str,
-    package_name: &str,
     candidate: IntentCandidate,
 ) -> Result<(), Box<dyn Error>> {
     let task_id = session_task_id(turn_index)?;
     let objective = format!("open {label}");
     store.create(TaskState::new_background_task(&task_id, objective))?;
-    grant_session_app_control(store, &task_id, source, package_name)?;
+    if source == TerminalSessionIntentSource::OwnerCommand {
+        store.transition_state(&task_id, |state| {
+            apply_owner_command_grants_for_intent_candidate(state, &candidate)
+        })?;
+    }
+
+    let task = store.load(&task_id)?;
+    match evaluate_intent_candidate_acceptance(
+        &task.state,
+        &candidate,
+        terminal_session_authority(source),
+    )? {
+        CandidateAcceptanceDecision::Accepted => {}
+        CandidateAcceptanceDecision::NeedsOwnerApproval {
+            reason,
+            missing_requirements,
+        } => {
+            let task = store.transition_state(&task_id, |state| {
+                require_owner_approval_for_intent_candidate(
+                    state,
+                    &candidate,
+                    reason.clone(),
+                    missing_requirements.clone(),
+                )
+            })?;
+            println!(
+                "needs confirmation: {}",
+                task.state
+                    .current_handoff
+                    .as_ref()
+                    .map(|handoff| handoff.reason.as_str())
+                    .unwrap_or("owner approval required")
+            );
+            return Ok(());
+        }
+    }
 
     let (model_activity, model_action) = candidate.into_loop_proposals();
     let accepted = AgentLoop::new(store.clone()).step(LoopStepRequest {
@@ -492,26 +523,10 @@ fn run_session_open_app(
     Ok(())
 }
 
-fn grant_session_app_control(
-    store: &TaskStore,
-    task_id: &str,
-    source: TerminalSessionIntentSource,
-    package_name: &str,
-) -> Result<(), Box<dyn Error>> {
+fn terminal_session_authority(source: TerminalSessionIntentSource) -> IntentCandidateAuthority {
     match source {
-        TerminalSessionIntentSource::OwnerCommand => {
-            store.transition_state(task_id, |mut state| {
-                state.contract.safety_grants.push(SafetyGrant::scoped(
-                    SafetyCapability::AppControl,
-                    SafetyScope::AndroidPackage {
-                        package_name: package_name.to_string(),
-                    },
-                ));
-                Ok::<_, TaskTransitionError>(state)
-            })?;
-            Ok(())
-        }
-        TerminalSessionIntentSource::ModelCandidate => Ok(()),
+        TerminalSessionIntentSource::OwnerCommand => IntentCandidateAuthority::OwnerCommand,
+        TerminalSessionIntentSource::ModelCandidate => IntentCandidateAuthority::ModelCandidate,
     }
 }
 
@@ -851,9 +866,28 @@ fn candidate_dry_run_json(intent: &TerminalSessionIntent) -> Result<String, serd
         | TerminalSessionCommand::List
         | TerminalSessionCommand::Quit => serde_json::Value::Null,
     };
+    let policy_decision = match &intent.command {
+        TerminalSessionCommand::OpenApp { candidate, .. } => {
+            let state = TaskState::new_background_task("candidate-dry-run", &candidate.prompt);
+            match evaluate_intent_candidate_acceptance(
+                &state,
+                candidate,
+                terminal_session_authority(intent.source),
+            ) {
+                Ok(decision) => serde_json::to_value(decision)?,
+                Err(error) => serde_json::json!({
+                    "Rejected": error.to_string(),
+                }),
+            }
+        }
+        TerminalSessionCommand::Help
+        | TerminalSessionCommand::List
+        | TerminalSessionCommand::Quit => serde_json::Value::Null,
+    };
     serde_json::to_string_pretty(&serde_json::json!({
         "source": terminal_session_source_label(intent.source),
         "candidate": candidate,
+        "policy_decision": policy_decision,
     }))
 }
 
@@ -1915,7 +1949,7 @@ mod tests {
     }
 
     #[test]
-    fn model_candidate_session_source_does_not_mint_owner_grants() {
+    fn model_candidate_session_source_pauses_for_owner_approval_without_minting_grants() {
         let store = test_store();
         let candidate = open_app_intent_candidate(
             "Settings",
@@ -1928,17 +1962,15 @@ mod tests {
             "open settings",
         );
 
-        let error = run_session_open_app(
+        run_session_open_app(
             &store,
             1,
             TerminalSessionIntentSource::ModelCandidate,
             "Settings",
-            "com.android.settings",
             candidate,
         )
-        .expect_err("model candidate should not receive owner grant");
+        .expect("model candidate should pause for approval");
 
-        assert!(error.to_string().contains("missing safety grant"));
         let task = store
             .list()
             .expect("list tasks")
@@ -1947,6 +1979,12 @@ mod tests {
             .expect("created task");
         assert!(task.state.contract.safety_grants.is_empty());
         assert!(task.state.current_action.is_none());
+        assert!(matches!(
+            task.state.blocker,
+            Some(TaskBlocker::WaitingForUserApproval { .. })
+        ));
+        assert!(task.state.current_handoff.is_some());
+        assert!(task.state.pending_intent_approval.is_some());
     }
 
     #[test]
@@ -1967,6 +2005,7 @@ mod tests {
             value["candidate"]["model_action"]["kind"],
             serde_json::json!("OpenApp")
         );
+        assert!(value["policy_decision"].get("NeedsOwnerApproval").is_some());
     }
 
     #[test]

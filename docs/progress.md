@@ -18,6 +18,7 @@ This list tracks the remaining gates before we can call the rooted Android proto
 - Local model provider contract exists: model output is an `IntentCandidate` below policy, execution, and observation.
 - Pixel local-model reconnaissance can report AICore/Gemini package presence without claiming an inference API.
 - The terminal session now routes deterministic prompts through the `IntentCandidate` seam, preserving provider/candidate provenance before policy acceptance.
+- Candidate acceptance policy exists: owner commands and model candidates are evaluated differently, and unauthorized model candidates pause with a typed owner-approval handoff instead of executing or failing opaquely.
 
 ## Remaining
 

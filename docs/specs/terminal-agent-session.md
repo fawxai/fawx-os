@@ -42,8 +42,8 @@ an inference API.
 fawx-terminal-runner candidate-dry-run "open settings"
 ```
 
-That command emits the `ModelCandidate` candidate JSON without granting,
-executing, or observing anything.
+That command emits the `ModelCandidate` candidate JSON and its policy decision
+without granting, executing, or observing anything.
 
 ## Contract
 
@@ -76,6 +76,8 @@ The session source is typed:
 - `ModelCandidate` may propose the same `IntentCandidate` shape, but it must not
   add grants. It can only be accepted when policy is already satisfied or after
   a separate owner-confirmation path adds the grant.
+- A `ModelCandidate` without matching policy creates a typed owner-approval
+  handoff instead of falling through into execution.
 
 The rest of the session flow should stay the same:
 
