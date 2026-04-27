@@ -11,9 +11,9 @@ use std::fmt::{Display, Formatter};
 use fawx_harness::{
     ForegroundPolicyDecision, ModelActionProposal, ModelActivityProposal, RuntimeEvent,
     RuntimeObservation, TaskPhase, TaskState, TaskTransitionError, accept_model_action_proposal,
-    apply_foreground_policy, clear_agent_activity, record_action_checkpoint,
-    record_current_blocker_activity, record_model_declared_activity, record_planning_activity,
-    require_external_condition, require_foreground_attention_for_package,
+    apply_foreground_policy, clear_agent_activity, observe_current_action,
+    record_action_checkpoint, record_current_blocker_activity, record_model_declared_activity,
+    record_planning_activity, require_external_condition, require_foreground_attention_for_package,
     satisfy_external_condition, satisfy_human_handoff,
 };
 use fawx_kernel::{
@@ -487,6 +487,13 @@ fn reduce_non_foreground_observation(
         RuntimeEvent::NetworkAvailabilityChanged { available: true } => {
             satisfy_external_condition(state, observation.clone())
         }
+        RuntimeEvent::NotificationReceived { .. } => observe_current_action(state, observation),
+        RuntimeEvent::NotificationUnavailable { target, reason, .. }
+            if has_open_notification_action(&state) =>
+        {
+            let reason = format!("notification target {target} unavailable: {reason:?}");
+            require_external_condition(state, reason, Some(observation.clone()))
+        }
         RuntimeEvent::RuntimeActionFailed { action, reason } => {
             let reason = format!("runtime action {action} failed: {reason}");
             require_external_condition(state, reason, Some(observation.clone()))
@@ -500,6 +507,21 @@ fn reduce_non_foreground_observation(
             Ok(state)
         }
     }
+}
+
+fn has_open_notification_action(state: &TaskState) -> bool {
+    state.current_action.as_ref().is_some_and(|action| {
+        matches!(
+            (&action.kind, &action.target, action.status),
+            (
+                fawx_kernel::AgentActionKind::Read
+                    | fawx_kernel::AgentActionKind::Observe
+                    | fawx_kernel::AgentActionKind::Verify,
+                Some(AgentActivityTarget::NotificationSurface),
+                AgentActionStatus::Accepted | AgentActionStatus::Executing
+            )
+        )
+    })
 }
 
 fn action_for_blocker(blocker: &Option<TaskBlocker>) -> Option<NextAction> {
@@ -607,6 +629,36 @@ mod tests {
         }
     }
 
+    fn android_notification(source: &str, summary: &str) -> RuntimeObservation {
+        RuntimeObservation {
+            source: RuntimeObservationSource::Android {
+                substrate: "AospPlatform".to_string(),
+                platform_event_source: Some(fawx_harness::RuntimePlatformEventSource {
+                    service_name: fawx_harness::AOSP_NOTIFICATION_LISTENER_SERVICE.to_string(),
+                    event_id: "event-1".to_string(),
+                }),
+            },
+            event: RuntimeEvent::NotificationReceived {
+                source: source.to_string(),
+                summary: summary.to_string(),
+            },
+        }
+    }
+
+    fn android_notification_unavailable() -> RuntimeObservation {
+        RuntimeObservation {
+            source: RuntimeObservationSource::Android {
+                substrate: "AospPlatform".to_string(),
+                platform_event_source: None,
+            },
+            event: RuntimeEvent::NotificationUnavailable {
+                target: "notifications".to_string(),
+                reason: fawx_harness::NotificationUnavailableReason::AdapterUnavailable,
+                raw_source: Some("listener not connected".to_string()),
+            },
+        }
+    }
+
     fn task_with_app_control(task_id: &str, objective: &str, package_name: &str) -> TaskState {
         let mut state = TaskState::new_background_task(task_id, objective);
         state.contract.safety_grants.push(SafetyGrant::scoped(
@@ -614,6 +666,15 @@ mod tests {
             SafetyScope::AndroidPackage {
                 package_name: package_name.to_string(),
             },
+        ));
+        state
+    }
+
+    fn task_with_notification_read(task_id: &str, objective: &str) -> TaskState {
+        let mut state = TaskState::new_background_task(task_id, objective);
+        state.contract.safety_grants.push(SafetyGrant::scoped(
+            SafetyCapability::NotificationsRead,
+            SafetyScope::NotificationSurface,
         ));
         state
     }
@@ -1391,6 +1452,124 @@ mod tests {
             .expect("current action");
         assert_eq!(action.status, AgentActionStatus::Observed);
         assert_eq!(action.boundary.state, ActionBoundaryState::Committed);
+    }
+
+    #[test]
+    fn accepted_notification_read_action_is_marked_observed_when_notification_arrives() {
+        let (store, loop_runner) = test_loop();
+        store
+            .create(task_with_notification_read("task-1", "read notifications"))
+            .expect("create task");
+        loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::Read,
+                    target: Some(AgentActivityTarget::NotificationSurface),
+                    reason: "read recent notifications".to_string(),
+                    expected_observation: Some("a notification is available".to_string()),
+                    proposal_id: None,
+                }),
+            })
+            .expect("accept action");
+        store
+            .transition_state("task-1", begin_current_action_execution)
+            .expect("begin action");
+
+        let result = loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![android_notification("com.example.mail", "New message")],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: None,
+            })
+            .expect("observe notification");
+
+        let action = result
+            .task
+            .state
+            .current_action
+            .as_ref()
+            .expect("current action");
+        assert_eq!(action.status, AgentActionStatus::Observed);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Committed);
+        assert!(result.task.state.blocker.is_none());
+    }
+
+    #[test]
+    fn notification_unavailable_blocks_only_open_notification_action() {
+        let (store, loop_runner) = test_loop();
+        store
+            .create(task_with_notification_read("task-1", "read notifications"))
+            .expect("create task");
+        loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: Some(ModelActionProposal {
+                    kind: ModelActionKind::Read,
+                    target: Some(AgentActivityTarget::NotificationSurface),
+                    reason: "read recent notifications".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                }),
+            })
+            .expect("accept action");
+        store
+            .transition_state("task-1", begin_current_action_execution)
+            .expect("begin action");
+
+        let result = loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![android_notification_unavailable()],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: None,
+            })
+            .expect("observe unavailable");
+
+        let action = result
+            .task
+            .state
+            .current_action
+            .as_ref()
+            .expect("current action");
+        assert_eq!(action.status, AgentActionStatus::Blocked);
+        assert!(matches!(
+            result.task.state.blocker,
+            Some(TaskBlocker::WaitingForExternalCondition { .. })
+        ));
+    }
+
+    #[test]
+    fn notification_unavailable_does_not_block_unrelated_action() {
+        let (store, loop_runner) = test_loop();
+        store
+            .create(TaskState::new_background_task("task-1", "plan work"))
+            .expect("create task");
+
+        let result = loop_runner
+            .step(LoopStepRequest {
+                task_id: "task-1".to_string(),
+                observations: vec![android_notification_unavailable()],
+                expected_foreground_package: None,
+                model_activity: None,
+                model_action: None,
+            })
+            .expect("ignore unrelated unavailable notification");
+
+        assert!(result.task.state.blocker.is_none());
+        assert_eq!(
+            result.task.state.last_runtime_observation,
+            Some(android_notification_unavailable())
+        );
     }
 
     #[test]

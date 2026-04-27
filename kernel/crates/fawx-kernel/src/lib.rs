@@ -165,6 +165,7 @@ pub enum AgentActivityTarget {
     Service { name: String },
     Contact { label: String },
     Network,
+    NotificationSurface,
     RuntimeAction { name: String },
     Task,
     Unknown,
@@ -315,6 +316,10 @@ pub enum AgentActionEvidence {
     ForegroundPackage {
         package_name: String,
         activity_name: Option<String>,
+    },
+    Notification {
+        source: String,
+        summary: String,
     },
     NetworkAvailable,
     RuntimeActionFailed {

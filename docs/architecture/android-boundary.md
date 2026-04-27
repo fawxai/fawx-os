@@ -140,7 +140,7 @@ Examples:
 
 - acquire foreground for target app
 - release foreground ownership
-- observe notifications for a source
+- read notifications from the notification surface
 - perform rooted device action
 - query current focus state
 - open or resume an app surface
@@ -341,6 +341,12 @@ from a typed notification-listener event emitted by
 Until a privileged AOSP notification listener emits that event, the probe must
 report `NotificationUnavailable(AdapterUnavailable)`. Rooted-stock notification
 scraping or shell output must not be promoted to AOSP notification evidence.
+
+At the runtime boundary, notification reads are not modeled as a generic service
+read. They target `NotificationSurface`, require the `NotificationsRead` safety
+grant, and can only close a current `Read`/`Observe`/`Verify` action when the
+runtime receives typed `NotificationReceived` evidence. This keeps notification
+truth structurally separate from both network services and shell/recon output.
 
 ## Minimum First-Implementation Contract
 

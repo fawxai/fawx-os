@@ -1727,6 +1727,7 @@ fn parse_safety_scope(value: &str) -> Result<SafetyScope, String> {
         AgentActivityTarget::Contact { label } => Ok(SafetyScope::Contact { label }),
         AgentActivityTarget::RuntimeAction { name } => Ok(SafetyScope::RuntimeAction { name }),
         AgentActivityTarget::Network => Ok(SafetyScope::Network),
+        AgentActivityTarget::NotificationSurface => Ok(SafetyScope::NotificationSurface),
         AgentActivityTarget::Task => Ok(SafetyScope::Task),
         AgentActivityTarget::Unknown => Err(format!("safety scope cannot use target: {value}")),
     }
@@ -1738,6 +1739,9 @@ fn parse_activity_target(value: &str) -> Result<AgentActivityTarget, String> {
     }
     if value == "network" {
         return Ok(AgentActivityTarget::Network);
+    }
+    if value == "notifications" {
+        return Ok(AgentActivityTarget::NotificationSurface);
     }
     if value == "unknown" {
         return Ok(AgentActivityTarget::Unknown);
@@ -2095,6 +2099,26 @@ mod tests {
             action.target,
             Some(AgentActivityTarget::AndroidPackage { package_name })
                 if package_name == "com.android.settings"
+        ));
+    }
+
+    #[test]
+    fn agent_step_options_parse_notification_read_action_contract() {
+        let options = AgentStepOptions::parse(&[
+            "--action-kind".to_string(),
+            "read".to_string(),
+            "--action-reason".to_string(),
+            "read notifications".to_string(),
+            "--action-target".to_string(),
+            "notifications".to_string(),
+        ])
+        .expect("parse notification read action");
+
+        let action = options.model_action.expect("model action");
+        assert_eq!(action.kind, ModelActionKind::Read);
+        assert!(matches!(
+            action.target,
+            Some(AgentActivityTarget::NotificationSurface)
         ));
     }
 
@@ -2580,6 +2604,18 @@ mod tests {
         assert_eq!(
             parse_safety_scope("task").expect("task is a runtime safety scope"),
             SafetyScope::Task
+        );
+    }
+
+    #[test]
+    fn safety_grant_parser_accepts_notification_scope() {
+        assert_eq!(
+            parse_safety_capability("notifications-read").expect("parse capability"),
+            SafetyCapability::NotificationsRead
+        );
+        assert_eq!(
+            parse_safety_scope("notifications").expect("notifications is a safety scope"),
+            SafetyScope::NotificationSurface
         );
     }
 
