@@ -57,7 +57,8 @@ assert_json "$aosp_output" '[.observations[] | select(.android_observation.event
 assert_json "$aosp_output" '[.observations[] | select(.android_observation.event.NotificationPostUnavailable.reason == "AdapterUnavailable")] | length == 1' "AOSP notification post is explicitly unavailable"
 assert_json "$aosp_output" '[.observations[] | select(.android_observation.event.MessageUnavailable.reason == "AdapterUnavailable")] | length == 1' "AOSP messaging is explicitly unavailable"
 assert_json "$aosp_output" '[.observations[] | select(.android_observation.event.PhoneCallUnavailable.reason == "AdapterUnavailable")] | length == 1' "AOSP phone calling is explicitly unavailable"
-assert_json "$aosp_output" '[.capability_statuses[] | select(.capability == "PlaceCall" and .status == "Available")] | length == 1' "AOSP probe shows privileged platform capabilities from typed map"
+assert_json "$aosp_output" '[.capability_statuses[] | select(.capability == "PlaceCall" and .status == "Unavailable")] | length == 1' "AOSP probe does not claim telephony until a platform adapter is connected"
+assert_json "$aosp_output" '[.capability_statuses[] | select(.capability == "ReadRuntimeScratchStorage" and .status == "Available")] | length == 1' "AOSP probe allows only runtime-owned scratch storage without platform adapters"
 assert_json "$aosp_output" '[.capability_statuses[] | select(.capability == "RootShell" and .status == "Unavailable")] | length == 1' "AOSP probe marks root shell unavailable as a platform primitive"
 
 echo "PASS substrate comparison smoke"

@@ -94,3 +94,26 @@ fawx-terminal-runner grant task-agent app-control android-package:com.android.se
 This command exists so Pixel smoke tests and terminal-only prototypes can grant
 authority without adding a UI yet. A future shell should expose the same
 contract through a user-facing permission flow.
+
+## Rooted Control Gate Commands
+
+The terminal runner also exposes deterministic Android control commands for
+prototype smokes:
+
+```sh
+fawx-terminal-runner android-command keyevent KEYCODE_HOME
+fawx-terminal-runner android-command write-file /data/local/tmp/fawx-os/probes/example.txt proof
+fawx-terminal-runner android-command read-file /data/local/tmp/fawx-os/probes/example.txt
+```
+
+These commands are still typed Android adapter requests. The rooted-stock
+adapter executes only capabilities marked `Available` or `Limited` for
+`ReconRootedStock`. Notification posting, messaging, and calling commands are
+intentionally present but rejected as `RequiresAospPrivilege`; that gives tests
+and future UI code a real contract for the missing permission boundary instead
+of a vague unsupported-command failure.
+
+The `write-file` and `read-file` commands are runtime scratch probes, not proof
+of Android shared storage access. They are restricted to `/data/local/tmp/fawx-os`
+and map to runtime scratch capabilities so the safety layer does not confuse
+test evidence with scoped-storage mediation.

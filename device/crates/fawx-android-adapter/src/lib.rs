@@ -7,6 +7,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 
@@ -74,6 +76,8 @@ pub enum AndroidCapability {
     PostNotifications,
     PlaceCall,
     SendMessage,
+    ReadRuntimeScratchStorage,
+    WriteRuntimeScratchStorage,
     ReadSharedStorage,
     WriteSharedStorage,
     NetworkAccess,
@@ -92,6 +96,8 @@ impl AndroidCapability {
         Self::PostNotifications,
         Self::PlaceCall,
         Self::SendMessage,
+        Self::ReadRuntimeScratchStorage,
+        Self::WriteRuntimeScratchStorage,
         Self::ReadSharedStorage,
         Self::WriteSharedStorage,
         Self::NetworkAccess,
@@ -129,56 +135,68 @@ pub const ANDROID_CAPABILITY_MAP: &[AndroidCapabilityEntry] = &[
     AndroidCapabilityEntry {
         capability: AndroidCapability::ObserveForegroundApp,
         rooted_stock: AndroidCapabilityStatus::Available,
-        aosp_platform: AndroidCapabilityStatus::Available,
-        note: "Recon can observe foreground focus through dumpsys; AOSP should expose a stable platform event.",
+        aosp_platform: AndroidCapabilityStatus::Unavailable,
+        note: "Recon can observe foreground focus through dumpsys; AOSP remains unavailable until a platform foreground observer is connected.",
     },
     AndroidCapabilityEntry {
         capability: AndroidCapability::LaunchApp,
         rooted_stock: AndroidCapabilityStatus::Limited,
-        aosp_platform: AndroidCapabilityStatus::Available,
-        note: "Recon can use activity-manager style shell commands, but reliable launch/resume belongs in a privileged adapter.",
+        aosp_platform: AndroidCapabilityStatus::Unavailable,
+        note: "Recon can use activity-manager style shell commands; AOSP launch remains unavailable until a privileged app controller is connected.",
     },
     AndroidCapabilityEntry {
         capability: AndroidCapability::ControlForegroundApp,
         rooted_stock: AndroidCapabilityStatus::Limited,
-        aosp_platform: AndroidCapabilityStatus::Available,
-        note: "Recon can probe input/UI automation, but durable control needs accessibility, shell, or framework integration.",
+        aosp_platform: AndroidCapabilityStatus::Unavailable,
+        note: "Recon can probe input/UI automation; AOSP foreground control remains unavailable until an accessibility or framework controller is connected.",
     },
     AndroidCapabilityEntry {
         capability: AndroidCapability::ReadNotifications,
         rooted_stock: AndroidCapabilityStatus::Limited,
-        aosp_platform: AndroidCapabilityStatus::Available,
-        note: "Recon may inspect notification state opportunistically; production needs a notification listener/system hook.",
+        aosp_platform: AndroidCapabilityStatus::Unavailable,
+        note: "Recon may inspect notification state opportunistically; AOSP notification read remains unavailable until a listener/system hook is connected.",
     },
     AndroidCapabilityEntry {
         capability: AndroidCapability::PostNotifications,
         rooted_stock: AndroidCapabilityStatus::RequiresAospPrivilege,
-        aosp_platform: AndroidCapabilityStatus::Available,
-        note: "Posting user-visible OS notifications should be a platform-owned capability, not a shell trick.",
+        aosp_platform: AndroidCapabilityStatus::Unavailable,
+        note: "Posting user-visible OS notifications has a typed seam, but no platform poster adapter exists yet.",
     },
     AndroidCapabilityEntry {
         capability: AndroidCapability::PlaceCall,
         rooted_stock: AndroidCapabilityStatus::RequiresAospPrivilege,
-        aosp_platform: AndroidCapabilityStatus::Available,
-        note: "Telephony side effects require explicit user/kernel authority and privileged platform integration.",
+        aosp_platform: AndroidCapabilityStatus::Unavailable,
+        note: "Telephony side effects have a typed seam, but no platform telephony adapter exists yet.",
     },
     AndroidCapabilityEntry {
         capability: AndroidCapability::SendMessage,
         rooted_stock: AndroidCapabilityStatus::RequiresAospPrivilege,
+        aosp_platform: AndroidCapabilityStatus::Unavailable,
+        note: "Messaging side effects have a typed seam, but no platform messaging adapter exists yet.",
+    },
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::ReadRuntimeScratchStorage,
+        rooted_stock: AndroidCapabilityStatus::Available,
         aosp_platform: AndroidCapabilityStatus::Available,
-        note: "Messaging side effects require explicit user/kernel authority and privileged platform integration.",
+        note: "Runtime-owned scratch storage under /data/local/tmp/fawx-os is available for prototype evidence and must not be confused with Android shared storage.",
+    },
+    AndroidCapabilityEntry {
+        capability: AndroidCapability::WriteRuntimeScratchStorage,
+        rooted_stock: AndroidCapabilityStatus::Available,
+        aosp_platform: AndroidCapabilityStatus::Available,
+        note: "Runtime-owned scratch storage under /data/local/tmp/fawx-os is available for prototype evidence and must not be confused with Android shared storage.",
     },
     AndroidCapabilityEntry {
         capability: AndroidCapability::ReadSharedStorage,
         rooted_stock: AndroidCapabilityStatus::Limited,
-        aosp_platform: AndroidCapabilityStatus::Available,
-        note: "Recon can read shell-accessible paths; AOSP should expose scoped storage through typed policy.",
+        aosp_platform: AndroidCapabilityStatus::Unavailable,
+        note: "Android shared/scoped storage mediation is not implemented yet; current file smokes only prove runtime scratch storage.",
     },
     AndroidCapabilityEntry {
         capability: AndroidCapability::WriteSharedStorage,
         rooted_stock: AndroidCapabilityStatus::Limited,
-        aosp_platform: AndroidCapabilityStatus::Available,
-        note: "Recon writes are path-limited and risky; AOSP should mediate writes through grants.",
+        aosp_platform: AndroidCapabilityStatus::Unavailable,
+        note: "Android shared/scoped storage mediation is not implemented yet; current file smokes only prove runtime scratch storage.",
     },
     AndroidCapabilityEntry {
         capability: AndroidCapability::NetworkAccess,
@@ -189,20 +207,20 @@ pub const ANDROID_CAPABILITY_MAP: &[AndroidCapabilityEntry] = &[
     AndroidCapabilityEntry {
         capability: AndroidCapability::BackgroundExecution,
         rooted_stock: AndroidCapabilityStatus::Limited,
-        aosp_platform: AndroidCapabilityStatus::Available,
-        note: "Recon can run detached shell processes; production requires supervised platform services.",
+        aosp_platform: AndroidCapabilityStatus::Unavailable,
+        note: "Recon can run detached shell processes; AOSP background execution remains unavailable until a supervised platform service is connected.",
     },
     AndroidCapabilityEntry {
         capability: AndroidCapability::InstallPackages,
         rooted_stock: AndroidCapabilityStatus::Limited,
-        aosp_platform: AndroidCapabilityStatus::Available,
-        note: "Recon package install is device-policy dependent; production requires package-manager authority.",
+        aosp_platform: AndroidCapabilityStatus::Unavailable,
+        note: "Recon package install is device-policy dependent; AOSP install remains unavailable until package-manager authority is connected.",
     },
     AndroidCapabilityEntry {
         capability: AndroidCapability::SystemSettings,
         rooted_stock: AndroidCapabilityStatus::Limited,
-        aosp_platform: AndroidCapabilityStatus::Available,
-        note: "Recon can inspect or poke some settings; production needs typed framework APIs.",
+        aosp_platform: AndroidCapabilityStatus::Unavailable,
+        note: "Recon can inspect or poke some settings; AOSP settings control remains unavailable until typed framework APIs are connected.",
     },
     AndroidCapabilityEntry {
         capability: AndroidCapability::RootShell,
@@ -368,9 +386,44 @@ pub enum AndroidCommand {
     ObserveNotifications {
         source: String,
     },
+    PostNotification {
+        title: String,
+        body: String,
+    },
     QueryForegroundState,
     ResumeAppSurface {
         package_name: String,
+    },
+    InputKeyEvent {
+        key_code: String,
+    },
+    InputTap {
+        x: u32,
+        y: u32,
+    },
+    InputText {
+        text: String,
+    },
+    InputSwipe {
+        x1: u32,
+        y1: u32,
+        x2: u32,
+        y2: u32,
+        duration_ms: Option<u32>,
+    },
+    ReadScopedFile {
+        path: String,
+    },
+    WriteScopedFile {
+        path: String,
+        contents: String,
+    },
+    SendMessage {
+        contact: String,
+        body: String,
+    },
+    PlaceCall {
+        number: String,
     },
     PerformRootedAction {
         capability: AndroidCapability,
@@ -576,6 +629,15 @@ impl AndroidCommand {
                 Some(AndroidCapability::ObserveForegroundApp)
             }
             Self::ObserveNotifications { .. } => Some(AndroidCapability::ReadNotifications),
+            Self::PostNotification { .. } => Some(AndroidCapability::PostNotifications),
+            Self::InputKeyEvent { .. }
+            | Self::InputTap { .. }
+            | Self::InputText { .. }
+            | Self::InputSwipe { .. } => Some(AndroidCapability::ControlForegroundApp),
+            Self::ReadScopedFile { .. } => Some(AndroidCapability::ReadRuntimeScratchStorage),
+            Self::WriteScopedFile { .. } => Some(AndroidCapability::WriteRuntimeScratchStorage),
+            Self::SendMessage { .. } => Some(AndroidCapability::SendMessage),
+            Self::PlaceCall { .. } => Some(AndroidCapability::PlaceCall),
             Self::PerformRootedAction { capability, .. } => Some(*capability),
         }
     }
@@ -801,6 +863,22 @@ pub fn execute_android_action_request(
     match &request.command {
         AndroidCommand::ResumeAppSurface { package_name } => {
             run_owned_command_output(resume_app_surface_command(package_name)?)
+        }
+        AndroidCommand::InputKeyEvent { key_code } => {
+            run_owned_command_output(input_keyevent_command(key_code)?)
+        }
+        AndroidCommand::InputTap { x, y } => run_owned_command_output(input_tap_command(*x, *y)),
+        AndroidCommand::InputText { text } => run_owned_command_output(input_text_command(text)?),
+        AndroidCommand::InputSwipe {
+            x1,
+            y1,
+            x2,
+            y2,
+            duration_ms,
+        } => run_owned_command_output(input_swipe_command(*x1, *y1, *x2, *y2, *duration_ms)),
+        AndroidCommand::ReadScopedFile { path } => read_scoped_file_output(path),
+        AndroidCommand::WriteScopedFile { path, contents } => {
+            write_scoped_file_output(path, contents)
         }
         command => Err(format!(
             "android command {command:?} is not executable by rooted-stock recon"
@@ -1258,6 +1336,121 @@ pub fn resume_app_surface_command(package_name: &str) -> Result<Vec<String>, Str
     ])
 }
 
+pub fn input_keyevent_command(key_code: &str) -> Result<Vec<String>, String> {
+    let key_code = key_code.trim();
+    if key_code.is_empty() {
+        return Err("input keyevent requires a key code".to_string());
+    }
+    if !key_code
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Err("input keyevent key code must be alphanumeric or underscore".to_string());
+    }
+    Ok(vec![
+        "input".to_string(),
+        "keyevent".to_string(),
+        key_code.to_string(),
+    ])
+}
+
+pub fn input_tap_command(x: u32, y: u32) -> Vec<String> {
+    vec![
+        "input".to_string(),
+        "tap".to_string(),
+        x.to_string(),
+        y.to_string(),
+    ]
+}
+
+pub fn input_text_command(text: &str) -> Result<Vec<String>, String> {
+    if text.is_empty() {
+        return Err("input text must not be empty".to_string());
+    }
+    if text.contains('\n') || text.contains('\r') {
+        return Err("input text must be single-line".to_string());
+    }
+    Ok(vec![
+        "input".to_string(),
+        "text".to_string(),
+        escape_input_text(text),
+    ])
+}
+
+pub fn input_swipe_command(
+    x1: u32,
+    y1: u32,
+    x2: u32,
+    y2: u32,
+    duration_ms: Option<u32>,
+) -> Vec<String> {
+    let mut command = vec![
+        "input".to_string(),
+        "swipe".to_string(),
+        x1.to_string(),
+        y1.to_string(),
+        x2.to_string(),
+        y2.to_string(),
+    ];
+    if let Some(duration_ms) = duration_ms {
+        command.push(duration_ms.to_string());
+    }
+    command
+}
+
+fn escape_input_text(text: &str) -> String {
+    text.replace('%', "%25").replace(' ', "%s")
+}
+
+fn read_scoped_file_output(path: &str) -> Result<CommandOutput, String> {
+    let path = scoped_fawx_os_path(path)?;
+    let stdout = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    Ok(CommandOutput {
+        stdout,
+        stderr: String::new(),
+        status: "read runtime scratch file".to_string(),
+        success: true,
+    })
+}
+
+fn write_scoped_file_output(path: &str, contents: &str) -> Result<CommandOutput, String> {
+    let path = scoped_fawx_os_path(path)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    fs::write(&path, contents)
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+    Ok(CommandOutput {
+        stdout: format!("wrote {} byte(s) to {}", contents.len(), path.display()),
+        stderr: String::new(),
+        status: "write runtime scratch file".to_string(),
+        success: true,
+    })
+}
+
+fn scoped_fawx_os_path(path: &str) -> Result<PathBuf, String> {
+    let path = Path::new(path);
+    let root = Path::new("/data/local/tmp/fawx-os");
+    if !path.is_absolute() {
+        return Err("scoped Android file path must be absolute".to_string());
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err("scoped Android file path must not contain parent traversal".to_string());
+    }
+    if !path.starts_with(root) {
+        return Err(format!(
+            "scoped Android file path must stay under {}",
+            root.display()
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
 fn run_owned_command_output(argv: Vec<String>) -> Result<CommandOutput, String> {
     let borrowed = argv.iter().map(String::as_str).collect::<Vec<_>>();
     run_command_output(&borrowed)
@@ -1352,7 +1545,7 @@ mod tests {
     #[test]
     fn adapter_accepts_typed_runtime_commands() {
         let request = AndroidActionRequest {
-            substrate: AndroidSubstrate::AospPlatform,
+            substrate: AndroidSubstrate::ReconRootedStock,
             command: AndroidCommand::AcquireForeground {
                 target: "subscription-cancel-flow".to_string(),
             },
@@ -1362,14 +1555,14 @@ mod tests {
             request.command,
             AndroidCommand::AcquireForeground { .. }
         ));
-        assert_eq!(request.substrate, AndroidSubstrate::AospPlatform);
+        assert_eq!(request.substrate, AndroidSubstrate::ReconRootedStock);
         assert_eq!(
             request.required_capability(),
             Some(AndroidCapability::LaunchApp)
         );
         assert_eq!(
             request.capability_status(),
-            Some(AndroidCapabilityStatus::Available)
+            Some(AndroidCapabilityStatus::Limited)
         );
     }
 
@@ -1389,7 +1582,10 @@ mod tests {
         let foreground = android_capability_entry(AndroidCapability::ObserveForegroundApp)
             .expect("foreground capability");
         assert_eq!(foreground.rooted_stock, AndroidCapabilityStatus::Available);
-        assert_eq!(foreground.aosp_platform, AndroidCapabilityStatus::Available);
+        assert_eq!(
+            foreground.aosp_platform,
+            AndroidCapabilityStatus::Unavailable
+        );
 
         let place_call =
             android_capability_entry(AndroidCapability::PlaceCall).expect("call capability");
@@ -1397,7 +1593,10 @@ mod tests {
             place_call.rooted_stock,
             AndroidCapabilityStatus::RequiresAospPrivilege
         );
-        assert_eq!(place_call.aosp_platform, AndroidCapabilityStatus::Available);
+        assert_eq!(
+            place_call.aosp_platform,
+            AndroidCapabilityStatus::Unavailable
+        );
 
         let root_shell =
             android_capability_entry(AndroidCapability::RootShell).expect("root capability");
@@ -1473,6 +1672,10 @@ mod tests {
         }));
         assert!(aosp.iter().any(|entry| {
             entry.capability == AndroidCapability::PlaceCall
+                && entry.status == AndroidCapabilityStatus::Unavailable
+        }));
+        assert!(aosp.iter().any(|entry| {
+            entry.capability == AndroidCapability::ReadRuntimeScratchStorage
                 && entry.status == AndroidCapabilityStatus::Available
         }));
     }
@@ -1488,6 +1691,8 @@ mod tests {
                 | AndroidCapability::PostNotifications
                 | AndroidCapability::PlaceCall
                 | AndroidCapability::SendMessage
+                | AndroidCapability::ReadRuntimeScratchStorage
+                | AndroidCapability::WriteRuntimeScratchStorage
                 | AndroidCapability::ReadSharedStorage
                 | AndroidCapability::WriteSharedStorage
                 | AndroidCapability::NetworkAccess
@@ -1704,6 +1909,90 @@ mod tests {
             Some(AndroidCapabilityStatus::Limited)
         );
         assert!(ensure_supported_action_request(&request).is_ok());
+    }
+
+    #[test]
+    fn rooted_stock_input_request_is_typed_control_foreground_capability() {
+        let request = AndroidActionRequest {
+            substrate: AndroidSubstrate::ReconRootedStock,
+            command: AndroidCommand::InputKeyEvent {
+                key_code: "KEYCODE_HOME".to_string(),
+            },
+        };
+
+        assert_eq!(
+            request.required_capability(),
+            Some(AndroidCapability::ControlForegroundApp)
+        );
+        assert_eq!(
+            request.capability_status(),
+            Some(AndroidCapabilityStatus::Limited)
+        );
+        assert!(ensure_supported_action_request(&request).is_ok());
+    }
+
+    #[test]
+    fn input_commands_are_argument_vector_commands_not_shell_strings() {
+        assert_eq!(
+            input_keyevent_command("KEYCODE_HOME").expect("keyevent command"),
+            ["input", "keyevent", "KEYCODE_HOME"]
+        );
+        assert_eq!(input_tap_command(10, 20), ["input", "tap", "10", "20"]);
+        assert_eq!(
+            input_text_command("hello world").expect("text command"),
+            ["input", "text", "hello%sworld"]
+        );
+        assert_eq!(
+            input_swipe_command(1, 2, 3, 4, Some(250)),
+            ["input", "swipe", "1", "2", "3", "4", "250"]
+        );
+    }
+
+    #[test]
+    fn input_text_rejects_multiline_payloads() {
+        let error = input_text_command("hello\nworld").expect_err("multiline rejected");
+
+        assert!(error.contains("single-line"));
+    }
+
+    #[test]
+    fn scoped_file_paths_must_stay_under_fawx_os_tmp_root() {
+        assert!(
+            scoped_fawx_os_path("/data/local/tmp/fawx-os/probes/file.txt").is_ok(),
+            "in-scope path should be accepted"
+        );
+        let outside = scoped_fawx_os_path("/sdcard/Download/file.txt")
+            .expect_err("outside path should be rejected");
+        assert!(outside.contains("/data/local/tmp/fawx-os"));
+        let traversal = scoped_fawx_os_path("/data/local/tmp/fawx-os/../escape")
+            .expect_err("traversal should be rejected");
+        assert!(traversal.contains("parent traversal"));
+    }
+
+    #[test]
+    fn rooted_stock_sensitive_side_effect_commands_remain_unavailable() {
+        for command in [
+            AndroidCommand::PostNotification {
+                title: "title".to_string(),
+                body: "body".to_string(),
+            },
+            AndroidCommand::SendMessage {
+                contact: "Ada".to_string(),
+                body: "hello".to_string(),
+            },
+            AndroidCommand::PlaceCall {
+                number: "+15555550100".to_string(),
+            },
+        ] {
+            let request = AndroidActionRequest {
+                substrate: AndroidSubstrate::ReconRootedStock,
+                command,
+            };
+
+            let error = ensure_supported_action_request(&request)
+                .expect_err("sensitive side-effect should require AOSP privilege");
+            assert!(error.contains("RequiresAospPrivilege"));
+        }
     }
 
     #[test]
