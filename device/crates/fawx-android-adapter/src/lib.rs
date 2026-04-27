@@ -316,6 +316,38 @@ pub fn run_recon_command(command: AndroidReconCommand) -> Result<String, String>
     }
 }
 
+pub fn execute_android_action_request(
+    request: &AndroidActionRequest,
+) -> Result<CommandOutput, String> {
+    ensure_supported_action_request(request)?;
+    match &request.command {
+        AndroidCommand::ResumeAppSurface { package_name } => {
+            run_owned_command_output(resume_app_surface_command(package_name)?)
+        }
+        command => Err(format!(
+            "android command {command:?} is not executable by rooted-stock recon"
+        )),
+    }
+}
+
+fn ensure_supported_action_request(request: &AndroidActionRequest) -> Result<(), String> {
+    if request.substrate != AndroidSubstrate::ReconRootedStock {
+        return Err(format!(
+            "android substrate {:?} is not executable by rooted-stock recon",
+            request.substrate
+        ));
+    }
+
+    match request.capability_status() {
+        Some(AndroidCapabilityStatus::Available | AndroidCapabilityStatus::Limited) => Ok(()),
+        Some(status) => Err(format!(
+            "android capability {:?} has unsupported rooted-stock status {status:?}",
+            request.required_capability()
+        )),
+        None => Ok(()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForegroundTarget {
     pub package_name: String,
@@ -439,6 +471,31 @@ enum ForegroundObservationFailure {
 
 pub fn foreground_focus_command() -> [&'static str; 2] {
     ["dumpsys", "window"]
+}
+
+pub fn resume_app_surface_command(package_name: &str) -> Result<Vec<String>, String> {
+    let original_package_name = package_name;
+    let package_name = original_package_name.trim();
+    if package_name.is_empty() {
+        return Err("cannot resume empty Android package".to_string());
+    }
+    if package_name != original_package_name {
+        return Err("Android package must not contain surrounding whitespace".to_string());
+    }
+
+    Ok(vec![
+        "monkey".to_string(),
+        "-p".to_string(),
+        package_name.to_string(),
+        "-c".to_string(),
+        "android.intent.category.LAUNCHER".to_string(),
+        "1".to_string(),
+    ])
+}
+
+fn run_owned_command_output(argv: Vec<String>) -> Result<CommandOutput, String> {
+    let borrowed = argv.iter().map(String::as_str).collect::<Vec<_>>();
+    run_command_output(&borrowed)
 }
 
 fn run_command_output(argv: &[&str]) -> Result<CommandOutput, String> {
@@ -693,6 +750,72 @@ mod tests {
     #[test]
     fn foreground_focus_command_runs_dumpsys_directly() {
         assert_eq!(foreground_focus_command(), ["dumpsys", "window"]);
+    }
+
+    #[test]
+    fn resume_app_surface_command_uses_package_only_launcher_intent() {
+        let argv = resume_app_surface_command("com.android.settings").expect("resume app command");
+
+        assert_eq!(
+            argv,
+            [
+                "monkey",
+                "-p",
+                "com.android.settings",
+                "-c",
+                "android.intent.category.LAUNCHER",
+                "1"
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_app_surface_command_rejects_empty_package() {
+        let error = resume_app_surface_command("  ").expect_err("empty package rejected");
+
+        assert!(error.contains("empty Android package"));
+    }
+
+    #[test]
+    fn resume_app_surface_command_rejects_surrounding_whitespace() {
+        let error =
+            resume_app_surface_command(" com.android.settings").expect_err("package rejected");
+
+        assert!(error.contains("surrounding whitespace"));
+    }
+
+    #[test]
+    fn rooted_stock_resume_app_request_is_executable() {
+        let request = AndroidActionRequest {
+            substrate: AndroidSubstrate::ReconRootedStock,
+            command: AndroidCommand::ResumeAppSurface {
+                package_name: "com.android.settings".to_string(),
+            },
+        };
+
+        assert_eq!(
+            request.required_capability(),
+            Some(AndroidCapability::LaunchApp)
+        );
+        assert_eq!(
+            request.capability_status(),
+            Some(AndroidCapabilityStatus::Limited)
+        );
+        assert!(ensure_supported_action_request(&request).is_ok());
+    }
+
+    #[test]
+    fn aosp_resume_app_request_is_not_executed_by_recon_adapter() {
+        let request = AndroidActionRequest {
+            substrate: AndroidSubstrate::AospPlatform,
+            command: AndroidCommand::ResumeAppSurface {
+                package_name: "com.android.settings".to_string(),
+            },
+        };
+
+        let error = ensure_supported_action_request(&request).expect_err("aosp execution rejected");
+
+        assert!(error.contains("not executable by rooted-stock recon"));
     }
 
     #[test]

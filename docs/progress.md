@@ -13,9 +13,8 @@ This list tracks the remaining gates before we can call the rooted Android proto
 - Permission and safety boundary gates sensitive actions through typed grants.
 - Human handoff requests persist typed resume conditions and clear only from matching evidence.
 - Real task harness scores repeatable rooted-phone tasks by typed outcomes and observation evidence.
+- Runtime-owned Android app-control execution can launch an app surface on rooted-stock Android and close the action only after typed foreground evidence observes the target package.
 
 ## Remaining
 
-- Runtime-owned Android app-control executor.
-  - Current harness proves action acceptance, executing state, and typed evidence closure.
-  - A future slice should make the runtime launch the app itself rather than using ADB setup.
+- No open rooted Android live-test readiness gates at this layer. The next work should graduate from harness readiness into higher-level task scheduling and agent-loop depth.

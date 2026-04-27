@@ -571,6 +571,51 @@ pub fn observe_current_action(
     Ok(state)
 }
 
+pub fn fail_current_action_execution(
+    mut state: TaskState,
+    observation: RuntimeObservation,
+) -> Result<TaskState, TaskTransitionError> {
+    ensure_not_terminal(&state)?;
+    let Some(action) = state.current_action.as_mut() else {
+        state.last_runtime_observation = Some(observation);
+        return Ok(state);
+    };
+    if !(action.status == AgentActionStatus::Executing
+        && action.boundary.state == ActionBoundaryState::Prepared)
+    {
+        state.last_runtime_observation = Some(observation);
+        return Ok(state);
+    }
+
+    let RuntimeEvent::RuntimeActionFailed {
+        action: name,
+        reason,
+    } = &observation.event
+    else {
+        state.last_runtime_observation = Some(observation);
+        return Ok(state);
+    };
+
+    action.status = AgentActionStatus::Failed;
+    action.boundary.state = ActionBoundaryState::Aborted;
+    action.last_observation = Some(
+        AgentActionObservation::new(
+            action.boundary.id.clone(),
+            AgentActionEvidence::RuntimeActionFailed {
+                action: name.clone(),
+                reason: reason.clone(),
+            },
+        )
+        .map_err(|_| TaskTransitionError::CheckpointClock)?,
+    );
+    state.blocker = Some(TaskBlocker::WaitingForExternalCondition {
+        reason: format!("runtime action {name} failed: {reason}"),
+    });
+    state.current_activity = blocker_activity(&state.blocker)?;
+    state.last_runtime_observation = Some(observation);
+    Ok(state)
+}
+
 fn validate_action_target(
     kind: &ModelActionKind,
     target: &Option<AgentActivityTarget>,
@@ -2140,6 +2185,52 @@ mod tests {
         assert_eq!(action.boundary.state, ActionBoundaryState::Planned);
         assert!(action.last_observation.is_none());
         assert_eq!(state.last_runtime_observation, Some(observation));
+    }
+
+    #[test]
+    fn fail_current_action_execution_records_runtime_failure_evidence() {
+        let state = begin_current_action_execution(
+            accept_model_action_proposal(
+                task_with_app_control("task-1", "open settings", "com.android.settings"),
+                ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.android.settings".to_string(),
+                    }),
+                    reason: "open settings".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                },
+            )
+            .expect("accept action"),
+        )
+        .expect("begin action");
+        let observation = RuntimeObservation {
+            source: RuntimeObservationSource::Android {
+                substrate: "ReconRootedStock".to_string(),
+            },
+            event: RuntimeEvent::RuntimeActionFailed {
+                action: "resume-app-surface".to_string(),
+                reason: "package not found".to_string(),
+            },
+        };
+
+        let state =
+            fail_current_action_execution(state, observation).expect("record runtime failure");
+        let action = state.current_action.expect("current action");
+
+        assert_eq!(action.status, AgentActionStatus::Failed);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Aborted);
+        assert!(matches!(
+            action.last_observation.as_ref().map(|value| &value.evidence),
+            Some(AgentActionEvidence::RuntimeActionFailed { action, reason })
+                if action == "resume-app-surface" && reason == "package not found"
+        ));
+        assert!(matches!(
+            state.blocker,
+            Some(TaskBlocker::WaitingForExternalCondition { reason })
+                if reason.contains("runtime action resume-app-surface failed")
+        ));
     }
 
     #[test]

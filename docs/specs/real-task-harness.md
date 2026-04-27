@@ -10,7 +10,7 @@ spine on a real phone:
 
 - observe the Android foreground as typed evidence
 - checkpoint background work
-- accept an app-control action, mark it executing, and close it from evidence
+- accept an app-control action, have the runtime execute it, and close it from evidence
 - close that action from scoped foreground evidence
 - pause on foreground handoff and resume from matching foreground evidence
 - pause on manual handoff and resume from explicit human completion evidence
@@ -57,8 +57,9 @@ A passing case must prove at least one durable control-plane fact, such as:
 stable, and semantically strict so we can run it frequently while moving toward
 an AOSP/system-image prototype.
 
-This harness does not yet prove a full Android app-launch executor. The current
-app-control case drives the foreground with ADB, then verifies that the Fawx
-control plane closes the typed action from scoped foreground evidence. A future
-executor slice should replace that setup step with a runtime-owned app-launch
-command.
+The app-control case may use ADB only for neutral setup, such as returning to
+home before the assertion begins. The launch under test must be runtime-owned:
+`fawx-terminal-runner execute-action` marks the accepted action executing and
+asks the Android adapter to resume the target package. The action is still not
+considered complete from command success alone; it closes only after a later
+typed foreground observation reports the expected package.

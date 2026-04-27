@@ -99,24 +99,26 @@ assert_json "$heartbeat_status" '.state.checkpoint.action_boundary.state == "Ver
 assert_json "$heartbeat_status" '.state.checkpoint.action_boundary.id == "heartbeat:3/3"' "heartbeat records final tick boundary"
 pass_case
 
-begin_case "open-app action closes from typed foreground evidence"
-run_runner "create task-open-launcher 'prove open app observation closure'" >/dev/null
-run_runner "grant task-open-launcher app-control android-package:com.google.android.apps.nexuslauncher" >/dev/null
-accept_output="$(run_runner "agent-step task-open-launcher --action-kind open-app --action-reason 'open launcher to inspect home screen' --action-target android-package:com.google.android.apps.nexuslauncher --expected-observation 'launcher is foreground'")"
-echo "$accept_output"
-assert_json "$accept_output" '.task.state.current_action.status == "Accepted"' "model action is accepted"
-begin_output="$(run_runner "begin-action task-open-launcher")"
-echo "$begin_output"
-assert_json "$begin_output" '.state.current_action.status == "Executing"' "action enters executing state"
+begin_case "runtime-owned open-app action closes from typed foreground evidence"
+run_runner "create task-open-settings 'prove runtime-owned app launch observation closure'" >/dev/null
+run_runner "grant task-open-settings app-control android-package:com.android.settings" >/dev/null
 "${ADB[@]}" shell "input keyevent KEYCODE_HOME"
 sleep 1
-tick_output="$(run_runner "background-tick 1 0 --foreground --foreground-task task-open-launcher")"
+accept_output="$(run_runner "agent-step task-open-settings --action-kind open-app --action-reason 'open settings to inspect system state' --action-target android-package:com.android.settings --expected-observation 'settings is foreground'")"
+echo "$accept_output"
+assert_json "$accept_output" '.task.state.current_action.status == "Accepted"' "model action is accepted"
+execute_output="$(run_runner "execute-action task-open-settings")"
+echo "$execute_output"
+assert_json "$execute_output" '.task.state.current_action.status == "Executing"' "runtime begins action execution"
+assert_json "$execute_output" '.execution.success == true' "runtime app launch command succeeds"
+sleep 1
+tick_output="$(run_runner "background-tick 1 0 --foreground")"
 echo "$tick_output"
-status_output="$(run_runner "status task-open-launcher")"
+status_output="$(run_runner "status task-open-settings")"
 echo "$status_output"
 assert_json "$status_output" '.state.current_action.status == "Observed"' "action becomes observed"
 assert_json "$status_output" '.state.current_action.boundary.state == "Committed"' "action boundary commits"
-assert_json "$status_output" '.state.current_action.last_observation.evidence.ForegroundPackage.package_name == "com.google.android.apps.nexuslauncher"' "foreground evidence is attached to action"
+assert_json "$status_output" '.state.current_action.last_observation.evidence.ForegroundPackage.package_name == "com.android.settings"' "foreground evidence is attached to action"
 pass_case
 
 begin_case "foreground handoff resumes from matching foreground observation"
