@@ -7,8 +7,9 @@ but the model must live below the control plane. Local inference may propose an
 intent candidate. It may not grant permissions, execute actions, or mark work
 complete.
 
-The current prototype keeps deterministic terminal parsing as the primary path
-and adds a read-only Pixel probe for possible local model surfaces.
+The current prototype keeps deterministic terminal parsing as the first provider
+behind this boundary and adds a read-only Pixel probe for possible local model
+surfaces.
 
 ## Contract
 
@@ -42,6 +43,24 @@ When a candidate action is accepted, its action boundary preserves candidate
 provenance with an `intent-candidate:<provider>:<candidate>` id. That gives the
 kernel an audit handle without making provider identity a source of authority.
 
+## Deterministic Provider
+
+`fawx-terminal-runner session` currently uses a deterministic provider:
+
+```text
+provider_id: deterministic-session-parser
+locality: DeterministicFallback
+```
+
+This is intentionally boring. It proves the candidate contract and keeps phone
+control testable before local inference is connected. A future AICore/Gemini
+adapter should produce the same `IntentCandidate` shape rather than bypassing
+the terminal/session action path.
+
+`fawx-terminal-runner candidate-dry-run <prompt>` exercises the non-owner
+`ModelCandidate` source without executing the candidate. It is a contract probe
+for future provider adapters, not a phone-control command.
+
 ## Pixel Gemini / AICore Probe
 
 `fawx-terminal-runner local-model-probe` runs on the phone and reports known
@@ -68,3 +87,10 @@ that adapter can be added without changing the task/action/observation contract.
 
 The fallback remains deterministic terminal parsing so phone-control tests stay
 stable when local inference is unavailable.
+
+The terminal session has two explicit sources:
+
+- `OwnerCommand` for direct user commands. This path may mint the exact scoped
+  grant needed by the command.
+- `ModelCandidate` for provider-generated candidates. This path must never mint
+  grants; it depends on existing policy or a separate owner confirmation.

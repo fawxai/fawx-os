@@ -17,6 +17,7 @@ This list tracks the remaining gates before we can call the rooted Android proto
 - Interactive terminal sessions can accept deterministic typed prompts and drive the same app-control execution/observation contract.
 - Local model provider contract exists: model output is an `IntentCandidate` below policy, execution, and observation.
 - Pixel local-model reconnaissance can report AICore/Gemini package presence without claiming an inference API.
+- The terminal session now routes deterministic prompts through the `IntentCandidate` seam, preserving provider/candidate provenance before policy acceptance.
 
 ## Remaining
 
