@@ -28,3 +28,11 @@ model-candidate path on a connected Pixel by piping `suggest open settings`,
 `ReconRootedStock` and `AospPlatform` modes. The AOSP mode intentionally reports
 platform observations as unavailable until a real privileged adapter exists; it
 is a boundary test, not a fake AOSP implementation.
+
+`./scripts/aosp-workspace-preflight.sh` checks whether the local machine and
+attached Pixel are ready for a real AOSP checkout/flash attempt. It does not
+download source or mutate the device. AOSP source and build artifacts must live
+outside this repository.
+
+`./scripts/aosp-workspace-init.sh` initializes that external checkout only after
+the preflight passes.
