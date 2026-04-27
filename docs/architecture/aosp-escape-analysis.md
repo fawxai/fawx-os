@@ -160,7 +160,7 @@ Unacceptable evidence:
 The next AOSP-directed experiments should be:
 
 1. Foreground observation system event: replace AOSP `AdapterUnavailable` with a
-   real privileged event source.
+   real privileged event source that emits `AospForegroundEvent`.
 2. App launch/resume platform command: replace shell-style launch with a system
    adapter command and typed execution result.
 3. Background supervisor service: prove a Rust-owned task can continue while the

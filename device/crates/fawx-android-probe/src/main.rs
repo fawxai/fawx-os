@@ -155,7 +155,7 @@ fn foreground_probe_observation(substrate: AndroidSubstrate) -> ProbeObservation
         }
     };
 
-    match observation.event.clone() {
+    match observation.event().clone() {
         AndroidEvent::ForegroundAppChanged {
             package_name,
             activity_name,
@@ -254,7 +254,7 @@ mod tests {
         }));
         assert!(observations.iter().any(|observation| {
             matches!(
-                observation.android_observation.as_ref().map(|value| &value.event),
+                observation.android_observation.as_ref().map(|value| value.event()),
                 Some(AndroidEvent::ForegroundObservationUnavailable {
                     reason: fawx_android_adapter::AndroidForegroundUnavailableReason::AdapterUnavailable,
                     ..

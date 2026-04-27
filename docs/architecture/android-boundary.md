@@ -244,6 +244,17 @@ explicit `AdapterUnavailable` result. This keeps the comparison honest:
 When a probe changes one of these facts, update the escape-analysis matrix so
 the project can see whether AOSP is opening doors or merely moving the walls.
 
+The first AOSP foreground success path is deliberately narrow:
+
+- `foreground_observation(AospPlatform)` returns `AdapterUnavailable`
+- shell/dumpsys parser helpers return `AdapterUnavailable` when called with
+  `AospPlatform`
+- only an auditable `AospForegroundEvent` from a platform service may create an
+  AOSP `ForegroundAppChanged`
+
+That means the future system service has one clean integration point, and recon
+code cannot accidentally masquerade as platform evidence.
+
 ## Minimum First-Implementation Contract
 
 For the first Android boundary implementation, we need:
