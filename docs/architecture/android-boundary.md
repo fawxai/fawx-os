@@ -323,6 +323,25 @@ Until a privileged AOSP app controller emits that result, the probe must report
 foreground verification remains a separate foreground observation so the runtime
 can independently prove that the requested surface actually settled.
 
+Notification read follows the same rule. AOSP notification success must come
+from a typed notification-listener event emitted by
+`fawx-system-notification-listener`:
+
+```json
+{
+  "app_package_name": "com.example.mail",
+  "summary": "New message from Ada",
+  "source": {
+    "service_name": "fawx-system-notification-listener",
+    "event_id": "event-123"
+  }
+}
+```
+
+Until a privileged AOSP notification listener emits that event, the probe must
+report `NotificationUnavailable(AdapterUnavailable)`. Rooted-stock notification
+scraping or shell output must not be promoted to AOSP notification evidence.
+
 ## Minimum First-Implementation Contract
 
 For the first Android boundary implementation, we need:

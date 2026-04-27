@@ -11,20 +11,21 @@ use fawx_agent_loop::{
 use fawx_android_adapter::{
     AndroidActionRequest, AndroidAppLaunchUnavailableReason,
     AndroidBackgroundSupervisorUnavailableReason, AndroidCommand, AndroidEvent,
-    AndroidForegroundUnavailableReason, AndroidObservation, AndroidObservationProvenance,
-    AndroidSubstrate, CommandOutput, LocalModelProbeReport, execute_android_action_request,
-    foreground_observation, local_model_probe,
+    AndroidForegroundUnavailableReason, AndroidNotificationUnavailableReason, AndroidObservation,
+    AndroidObservationProvenance, AndroidSubstrate, CommandOutput, LocalModelProbeReport,
+    execute_android_action_request, foreground_observation, local_model_probe,
 };
 use fawx_harness::{
     AppLaunchUnavailableReason, BackgroundSupervisorUnavailableReason, CandidateAcceptanceDecision,
     ForegroundPolicyDecision, ForegroundUnavailableReason, IntentCandidate,
     IntentCandidateAuthority, LocalModelLocality, LocalModelProviderRef, ModelActionKind,
-    ModelActionProposal, ModelActivityKind, ModelActivityProposal, RuntimeEvent,
-    RuntimeObservation, RuntimeObservationSource, RuntimePlatformEventSource, TaskState,
-    TaskTransitionError, apply_foreground_policy, apply_owner_command_grants_for_intent_candidate,
-    begin_current_action_execution, evaluate_intent_candidate_acceptance,
-    fail_current_action_execution, record_action_checkpoint, require_foreground_attention,
-    require_owner_approval_for_intent_candidate, satisfy_human_handoff,
+    ModelActionProposal, ModelActivityKind, ModelActivityProposal, NotificationUnavailableReason,
+    RuntimeEvent, RuntimeObservation, RuntimeObservationSource, RuntimePlatformEventSource,
+    TaskState, TaskTransitionError, apply_foreground_policy,
+    apply_owner_command_grants_for_intent_candidate, begin_current_action_execution,
+    evaluate_intent_candidate_acceptance, fail_current_action_execution, record_action_checkpoint,
+    require_foreground_attention, require_owner_approval_for_intent_candidate,
+    satisfy_human_handoff,
 };
 use fawx_kernel::{
     ActionBoundary, ActionBoundaryState, AgentActionStatus, AgentActivityTarget,
@@ -1573,6 +1574,19 @@ fn runtime_observation_from_android(observation: &AndroidObservation) -> Runtime
                     summary: summary.clone(),
                 }
             }
+            AndroidEvent::NotificationUnavailable {
+                target,
+                reason,
+                raw_source,
+            } => RuntimeEvent::NotificationUnavailable {
+                target: target.clone(),
+                reason: match reason {
+                    AndroidNotificationUnavailableReason::AdapterUnavailable => {
+                        NotificationUnavailableReason::AdapterUnavailable
+                    }
+                },
+                raw_source: raw_source.clone(),
+            },
             AndroidEvent::NetworkAvailabilityChanged { available } => {
                 RuntimeEvent::NetworkAvailabilityChanged {
                     available: *available,
@@ -2464,6 +2478,41 @@ mod tests {
             runtime_observation.event,
             RuntimeEvent::AppLaunchCompleted { package_name, .. }
                 if package_name == "com.android.settings"
+        ));
+    }
+
+    #[test]
+    fn aosp_notification_runtime_observation_preserves_platform_event_source() {
+        let android_observation =
+            fawx_android_adapter::aosp_notification_observation_from_platform_event(
+                fawx_android_adapter::AospNotificationEvent {
+                    app_package_name: "com.example.mail".to_string(),
+                    summary: "New message from Ada".to_string(),
+                    source: fawx_android_adapter::AospPlatformEventSource {
+                        service_name: fawx_android_adapter::AOSP_NOTIFICATION_LISTENER_SERVICE
+                            .to_string(),
+                        event_id: "event-123".to_string(),
+                    },
+                },
+            )
+            .expect("valid notification event");
+
+        let runtime_observation = runtime_observation_from_android(&android_observation);
+
+        assert_eq!(
+            runtime_observation.source,
+            RuntimeObservationSource::Android {
+                substrate: "AospPlatform".to_string(),
+                platform_event_source: Some(RuntimePlatformEventSource {
+                    service_name: "fawx-system-notification-listener".to_string(),
+                    event_id: "event-123".to_string(),
+                }),
+            }
+        );
+        assert!(matches!(
+            runtime_observation.event,
+            RuntimeEvent::NotificationReceived { source, summary }
+                if source == "com.example.mail" && summary == "New message from Ada"
         ));
     }
 
