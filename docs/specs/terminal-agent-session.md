@@ -26,6 +26,16 @@ The session supports:
 - `help`
 - `quit`
 
+The runner also exposes a non-session diagnostic:
+
+```sh
+fawx-terminal-runner local-model-probe
+```
+
+That command reports likely local model surfaces on the phone, such as AICore or
+Gemini packages, but it does not call them or treat package presence as proof of
+an inference API.
+
 ## Contract
 
 For an `open ...` prompt, the runner must:

@@ -228,6 +228,72 @@ pub struct ModelActionProposal {
     pub proposal_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalModelProviderRef {
+    pub provider_id: String,
+    pub locality: LocalModelLocality,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalModelLocality {
+    DeviceLocal,
+    CloudDelegated,
+    DeterministicFallback,
+}
+
+/// A candidate proposed by a model or deterministic interpreter.
+///
+/// This type deliberately carries no safety grants and no execution result.
+/// It can only propose typed activity/action content; the harness still owns
+/// policy acceptance, runtime execution, and observation closure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentCandidate {
+    pub candidate_id: String,
+    pub provider: LocalModelProviderRef,
+    pub prompt: String,
+    #[serde(default)]
+    pub model_activity: Option<ModelActivityProposal>,
+    #[serde(default)]
+    pub model_action: Option<ModelActionProposal>,
+}
+
+impl IntentCandidate {
+    pub fn into_loop_proposals(
+        self,
+    ) -> (Option<ModelActivityProposal>, Option<ModelActionProposal>) {
+        let proposal_boundary_id = self.proposal_boundary_id();
+        let action = self.model_action.map(|mut action| {
+            action.proposal_id = Some(proposal_boundary_id);
+            action
+        });
+        (self.model_activity, action)
+    }
+
+    fn proposal_boundary_id(&self) -> String {
+        format!(
+            "intent-candidate:{}:{}",
+            boundary_id_fragment(&self.provider.provider_id),
+            boundary_id_fragment(&self.candidate_id)
+        )
+    }
+}
+
+fn boundary_id_fragment(value: &str) -> String {
+    let fragment = value
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => character,
+            _ => '-',
+        })
+        .collect::<String>();
+    let fragment = fragment.trim_matches('-');
+    if fragment.is_empty() {
+        "unknown".to_string()
+    } else {
+        fragment.to_string()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelActionKind {
     Observe,
@@ -3248,5 +3314,116 @@ mod tests {
         .expect_err("terminal checkpoint should reject");
 
         assert!(matches!(error, TaskTransitionError::TerminalTask { .. }));
+    }
+
+    #[test]
+    fn intent_candidate_carries_proposals_but_cannot_mint_authority() {
+        let candidate = IntentCandidate {
+            candidate_id: "candidate-1".to_string(),
+            provider: LocalModelProviderRef {
+                provider_id: "pixel-aicore-probe".to_string(),
+                locality: LocalModelLocality::DeviceLocal,
+            },
+            prompt: "open settings".to_string(),
+            model_activity: Some(ModelActivityProposal {
+                kind: ModelActivityKind::Planning,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                description: "Plan to open settings.".to_string(),
+            }),
+            model_action: Some(ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                reason: "open settings".to_string(),
+                expected_observation: Some("settings is foreground".to_string()),
+                proposal_id: None,
+            }),
+        };
+
+        let (_activity, action) = candidate.into_loop_proposals();
+        let state = TaskState::new_background_task("task-1", "open settings");
+        let error = accept_model_action_proposal(state, action.expect("candidate action"))
+            .expect_err("candidate cannot bypass missing grant");
+
+        assert!(matches!(error, TaskTransitionError::InvalidAction { .. }));
+        assert!(error.to_string().contains("missing safety grant"));
+    }
+
+    #[test]
+    fn accepted_intent_candidate_preserves_provider_provenance_in_boundary() {
+        let candidate = IntentCandidate {
+            candidate_id: "candidate 1".to_string(),
+            provider: LocalModelProviderRef {
+                provider_id: "pixel/aicore".to_string(),
+                locality: LocalModelLocality::DeviceLocal,
+            },
+            prompt: "open settings".to_string(),
+            model_activity: None,
+            model_action: Some(ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                reason: "open settings".to_string(),
+                expected_observation: Some("settings is foreground".to_string()),
+                proposal_id: None,
+            }),
+        };
+        let (_activity, action) = candidate.into_loop_proposals();
+        let mut state = TaskState::new_background_task("task-1", "open settings");
+        state.contract.safety_grants.push(SafetyGrant::scoped(
+            SafetyCapability::AppControl,
+            SafetyScope::AndroidPackage {
+                package_name: "com.android.settings".to_string(),
+            },
+        ));
+
+        let state =
+            accept_model_action_proposal(state, action.expect("candidate action")).expect("accept");
+
+        assert_eq!(
+            state
+                .current_action
+                .as_ref()
+                .map(|action| action.boundary.id.as_str()),
+            Some("intent-candidate:pixel-aicore:candidate-1")
+        );
+    }
+
+    #[test]
+    fn intent_candidate_overrides_embedded_proposal_id_with_provider_provenance() {
+        let candidate = IntentCandidate {
+            candidate_id: "candidate-1".to_string(),
+            provider: LocalModelProviderRef {
+                provider_id: "pixel-aicore".to_string(),
+                locality: LocalModelLocality::DeviceLocal,
+            },
+            prompt: "open settings".to_string(),
+            model_activity: None,
+            model_action: Some(ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                reason: "open settings".to_string(),
+                expected_observation: Some("settings is foreground".to_string()),
+                proposal_id: Some("model-supplied-id".to_string()),
+            }),
+        };
+        let (_activity, action) = candidate.into_loop_proposals();
+
+        assert_eq!(
+            action.expect("candidate action").proposal_id.as_deref(),
+            Some("intent-candidate:pixel-aicore:candidate-1")
+        );
+    }
+
+    #[test]
+    fn intent_candidate_boundary_fragments_have_empty_fallback() {
+        assert_eq!(boundary_id_fragment("///"), "unknown");
+        assert_eq!(boundary_id_fragment("provider/id 1"), "provider-id-1");
     }
 }

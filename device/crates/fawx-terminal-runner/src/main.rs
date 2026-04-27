@@ -10,8 +10,8 @@ use fawx_agent_loop::{
 };
 use fawx_android_adapter::{
     AndroidActionRequest, AndroidCommand, AndroidEvent, AndroidForegroundUnavailableReason,
-    AndroidObservation, AndroidSubstrate, CommandOutput, execute_android_action_request,
-    foreground_observation,
+    AndroidObservation, AndroidSubstrate, CommandOutput, LocalModelProbeReport,
+    execute_android_action_request, foreground_observation, local_model_probe,
 };
 use fawx_harness::{
     ForegroundPolicyDecision, ForegroundUnavailableReason, ModelActionKind, ModelActionProposal,
@@ -117,6 +117,9 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         "execute-action" => {
             let task_id = required_arg(&args, 1, "task id")?;
             run_execute_action(&store, task_id)?;
+        }
+        "local-model-probe" => {
+            run_local_model_probe()?;
         }
         "session" => {
             run_terminal_session(&store)?;
@@ -695,6 +698,16 @@ fn run_execute_action(store: &TaskStore, task_id: &str) -> Result<(), Box<dyn Er
         .into());
     }
     Ok(())
+}
+
+fn run_local_model_probe() -> Result<(), Box<dyn Error>> {
+    let report = local_model_probe(AndroidSubstrate::ReconRootedStock);
+    println!("{}", local_model_probe_json(&report)?);
+    Ok(())
+}
+
+fn local_model_probe_json(report: &LocalModelProbeReport) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(report)
 }
 
 fn execute_action(
@@ -1356,6 +1369,7 @@ fn print_usage() {
     );
     eprintln!("  fawx-terminal-runner begin-action <task-id>");
     eprintln!("  fawx-terminal-runner execute-action <task-id>");
+    eprintln!("  fawx-terminal-runner local-model-probe");
     eprintln!("  fawx-terminal-runner session");
     eprintln!("  fawx-terminal-runner heartbeat <task-id> [count] [interval-ms] [--foreground]");
     eprintln!(
@@ -1804,6 +1818,37 @@ mod tests {
         assert!(summary.contains("exit status: 1"));
         assert!(summary.contains("stderr text"));
         assert!(summary.contains("stdout text"));
+    }
+
+    #[test]
+    fn local_model_probe_json_preserves_provider_status_shape() {
+        let report = LocalModelProbeReport {
+            substrate: AndroidSubstrate::ReconRootedStock,
+            providers: vec![fawx_android_adapter::LocalModelProviderProbe {
+                kind: fawx_android_adapter::LocalModelProviderKind::AicoreGeminiNano,
+                status: fawx_android_adapter::LocalModelProviderStatus::Indeterminate,
+                package_name: None,
+                evidence: vec!["pm list packages failed: denied".to_string()],
+                note: "probe failed".to_string(),
+            }],
+        };
+
+        let json = local_model_probe_json(&report).expect("probe json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+
+        assert_eq!(value["substrate"], "ReconRootedStock");
+        assert_eq!(
+            value["providers"][0]["kind"],
+            serde_json::json!("AicoreGeminiNano")
+        );
+        assert_eq!(
+            value["providers"][0]["status"],
+            serde_json::json!("Indeterminate")
+        );
+        assert_eq!(
+            value["providers"][0]["evidence"][0],
+            serde_json::json!("pm list packages failed: denied")
+        );
     }
 
     #[test]
