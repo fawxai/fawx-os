@@ -90,6 +90,15 @@ The next step is to grow that slice into:
 4. browser capability
 5. explicit cloud escalation boundary
 
+The first real AOSP gate is foreground observation from a privileged platform
+producer. Before attempting any AOSP checkout or flash, run:
+
+```sh
+./scripts/aosp-workspace-preflight.sh
+```
+
+AOSP source and build artifacts intentionally live outside this repository.
+
 Before review, run:
 
 ```sh

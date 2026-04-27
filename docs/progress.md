@@ -32,9 +32,11 @@ This list tracks the remaining gates before we can call the rooted Android proto
 - Notification posting, messaging, and telephony now have typed AOSP unavailable seams so high-risk side-effect surfaces are visible in the control plane before real adapters exist.
 - The Pixel real-task harness proves notification reads do not close from terminal-minted notification evidence; closure still requires a real listener-provenanced `NotificationReceived` event.
 - The first real AOSP prototype plan is written: foreground observation is the first platform primitive, and AOSP must prove it with `fawx-system-foreground-observer` rather than shell or `dumpsys`.
+- AOSP workspace preflight scripts exist and keep AOSP source/build artifacts outside this repository.
 
 ## Remaining
 
+- AOSP checkout is blocked locally until enough disk is available and the Pixel bootloader unlock/flash path is intentionally taken.
 - Local model inference is not connected yet. The current terminal session uses deterministic intent parsing so the runtime contract can be tested before model quality is introduced.
 - If AICore/Gemini Nano exposes a supported API surface, add it as a provider adapter that emits candidates into the existing contract.
 - AOSP/system-image testing is not connected yet. The next AOSP slice should make a real privileged foreground observer produce the first platform event currently supplied by a probe ingest file.
