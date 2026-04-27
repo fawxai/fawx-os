@@ -14,7 +14,8 @@ This list tracks the remaining gates before we can call the rooted Android proto
 - Human handoff requests persist typed resume conditions and clear only from matching evidence.
 - Real task harness scores repeatable rooted-phone tasks by typed outcomes and observation evidence.
 - Runtime-owned Android app-control execution can launch an app surface on rooted-stock Android and close the action only after typed foreground evidence observes the target package.
+- Interactive terminal sessions can accept deterministic typed prompts and drive the same app-control execution/observation contract.
 
 ## Remaining
 
-- No open rooted Android live-test readiness gates at this layer. The next work should graduate from harness readiness into higher-level task scheduling and agent-loop depth.
+- Local model inference is not connected yet. The current terminal session uses deterministic intent parsing so the runtime contract can be tested before model quality is introduced.

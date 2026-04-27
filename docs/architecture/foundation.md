@@ -77,6 +77,20 @@ The right model is:
 3. Fawx OS core runtime lives in Rust.
 4. Device, browser, cloud, and shell surfaces speak to that Rust core through explicit contracts.
 
+At the product boundary, this should feel like three layers rather than a
+traditional app launcher:
+
+1. Ambient intent capture: typed, permissioned signals about what the user may
+   want.
+2. Agentic execution: the runtime performs work across device, browser, cloud,
+   API, and human-handoff surfaces.
+3. Ephemeral verification UX: disposable surfaces for approval, comparison,
+   editing, rejection, or enjoyment.
+
+The UI is therefore not the operating system. The durable OS primitive is typed
+intent, execution state, evidence, and verification. UI is generated around
+tasks when the human needs to participate.
+
 One consequence of this model is that task execution state must live below the current shell surface. The active UI cannot be the source of truth for whether agent work is still running. Background execution, resumability, and user interruption tolerance must be designed into the runtime from the start.
 
 That keeps the long-term migration path open:
