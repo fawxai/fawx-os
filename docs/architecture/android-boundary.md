@@ -281,6 +281,26 @@ the foreground primitive, `service_name` must be
 `fawx-system-foreground-observer`; shell-like producers such as `dumpsys` are
 rejected by the adapter.
 
+Background execution follows the same shape. AOSP supervisor success is not
+"an adb process stayed alive." It is a typed heartbeat from
+`fawx-system-background-supervisor`:
+
+```json
+{
+  "supervisor_id": "supervisor-1",
+  "active_tasks": 2,
+  "source": {
+    "service_name": "fawx-system-background-supervisor",
+    "event_id": "event-123"
+  }
+}
+```
+
+Until a privileged AOSP service emits that event, the probe must report
+`BackgroundSupervisorUnavailable(AdapterUnavailable)`. This keeps background
+execution score 1 in the escape rubric: the ingest seam exists, but the
+substrate has not yet proven platform-owned supervision.
+
 ## Minimum First-Implementation Contract
 
 For the first Android boundary implementation, we need:

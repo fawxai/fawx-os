@@ -75,7 +75,7 @@ rooted/AOSP probes.
 | --- | --- | --- | --- | --- |
 | Foreground observation | Typed app/window focus events without shell parsing | Rooted recon uses `dumpsys`; AOSP has a typed event ingest seam, but no real service producer yet | 1 | Medium |
 | App launch/resume | Typed platform command with result evidence | Rooted recon can launch with `monkey`; AOSP contract says available but not implemented | 1 | Medium |
-| Background execution | Supervised long-running service below UI lifecycle | Rust process can run through adb/recon; AOSP service not implemented | 1 | High |
+| Background execution | Supervised long-running service below UI lifecycle | AOSP has a typed supervisor ingest seam, but no real service producer yet | 1 | High |
 | Notification read | Typed notification events with source/app metadata | Capability map says AOSP should own this; no adapter yet | U | High |
 | Notification post | Typed user-visible notification action | Requires AOSP privilege on rooted stock; no adapter yet | U | Medium |
 | Phone call | Typed call action with explicit user/policy grant | Requires AOSP privilege; no telephony adapter yet | U | High |
@@ -163,8 +163,9 @@ The next AOSP-directed experiments should be:
    `AospForegroundEvent` ingest seam and prove it emits without shell/dumpsys.
 2. App launch/resume platform command: replace shell-style launch with a system
    adapter command and typed execution result.
-3. Background supervisor service: prove a Rust-owned task can continue while the
-   user changes apps.
+3. Background supervisor service: connect a real privileged service to the
+   `fawx-system-background-supervisor` heartbeat seam and prove it survives app
+   switching.
 4. Notification read bridge: prove typed notification events can enter the
    runtime without app-level scraping.
 

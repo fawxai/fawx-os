@@ -9,16 +9,17 @@ use fawx_agent_loop::{
     AgentLoop, BackgroundObservation, BackgroundRunner, BackgroundTickRequest, LoopStepRequest,
 };
 use fawx_android_adapter::{
-    AndroidActionRequest, AndroidCommand, AndroidEvent, AndroidForegroundUnavailableReason,
-    AndroidObservation, AndroidSubstrate, CommandOutput, LocalModelProbeReport,
-    execute_android_action_request, foreground_observation, local_model_probe,
+    AndroidActionRequest, AndroidBackgroundSupervisorUnavailableReason, AndroidCommand,
+    AndroidEvent, AndroidForegroundUnavailableReason, AndroidObservation, AndroidSubstrate,
+    CommandOutput, LocalModelProbeReport, execute_android_action_request, foreground_observation,
+    local_model_probe,
 };
 use fawx_harness::{
-    CandidateAcceptanceDecision, ForegroundPolicyDecision, ForegroundUnavailableReason,
-    IntentCandidate, IntentCandidateAuthority, LocalModelLocality, LocalModelProviderRef,
-    ModelActionKind, ModelActionProposal, ModelActivityKind, ModelActivityProposal, RuntimeEvent,
-    RuntimeObservation, RuntimeObservationSource, TaskState, TaskTransitionError,
-    apply_foreground_policy, apply_owner_command_grants_for_intent_candidate,
+    BackgroundSupervisorUnavailableReason, CandidateAcceptanceDecision, ForegroundPolicyDecision,
+    ForegroundUnavailableReason, IntentCandidate, IntentCandidateAuthority, LocalModelLocality,
+    LocalModelProviderRef, ModelActionKind, ModelActionProposal, ModelActivityKind,
+    ModelActivityProposal, RuntimeEvent, RuntimeObservation, RuntimeObservationSource, TaskState,
+    TaskTransitionError, apply_foreground_policy, apply_owner_command_grants_for_intent_candidate,
     begin_current_action_execution, evaluate_intent_candidate_acceptance,
     fail_current_action_execution, record_action_checkpoint, require_foreground_attention,
     require_owner_approval_for_intent_candidate, satisfy_human_handoff,
@@ -1504,6 +1505,26 @@ fn runtime_observation_from_android(observation: &AndroidObservation) -> Runtime
                     }
                     AndroidForegroundUnavailableReason::AdapterUnavailable => {
                         ForegroundUnavailableReason::AdapterUnavailable
+                    }
+                },
+                raw_source: raw_source.clone(),
+            },
+            AndroidEvent::BackgroundSupervisorHeartbeat {
+                supervisor_id,
+                active_tasks,
+            } => RuntimeEvent::BackgroundSupervisorHeartbeat {
+                supervisor_id: supervisor_id.clone(),
+                active_tasks: *active_tasks,
+            },
+            AndroidEvent::BackgroundSupervisorUnavailable {
+                target,
+                reason,
+                raw_source,
+            } => RuntimeEvent::BackgroundSupervisorUnavailable {
+                target: target.clone(),
+                reason: match reason {
+                    AndroidBackgroundSupervisorUnavailableReason::AdapterUnavailable => {
+                        BackgroundSupervisorUnavailableReason::AdapterUnavailable
                     }
                 },
                 raw_source: raw_source.clone(),

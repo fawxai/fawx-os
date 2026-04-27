@@ -263,6 +263,15 @@ pub enum AndroidEvent {
         reason: AndroidForegroundUnavailableReason,
         raw_source: Option<String>,
     },
+    BackgroundSupervisorHeartbeat {
+        supervisor_id: String,
+        active_tasks: u32,
+    },
+    BackgroundSupervisorUnavailable {
+        target: String,
+        reason: AndroidBackgroundSupervisorUnavailableReason,
+        raw_source: Option<String>,
+    },
     TargetSurfaceBecameUnavailable {
         target: String,
     },
@@ -287,6 +296,11 @@ pub enum AndroidForegroundUnavailableReason {
     CommandFailed,
     EmptyOutput,
     ParseFailed,
+    AdapterUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AndroidBackgroundSupervisorUnavailableReason {
     AdapterUnavailable,
 }
 
@@ -354,32 +368,43 @@ impl<'de> Deserialize<'de> for AndroidObservation {
         }
 
         let wire = WireAndroidObservation::deserialize(deserializer)?;
-        if let (AndroidSubstrate::AospPlatform, AndroidEvent::ForegroundAppChanged { .. }) =
-            (&wire.substrate, &wire.event)
-        {
-            let Some(AndroidObservationProvenance::AospPlatformEvent { source }) =
-                wire.provenance.as_ref()
-            else {
-                return Err(serde::de::Error::custom(
-                    "AospPlatform foreground observations require AospPlatformEvent provenance",
-                ));
-            };
-            validate_aosp_platform_event_source(source).map_err(serde::de::Error::custom)?;
-        }
-
-        if matches!(
-            (&wire.substrate, &wire.event),
-            (
-                AndroidSubstrate::AospPlatform,
+        if wire.substrate == AndroidSubstrate::AospPlatform {
+            match &wire.event {
+                AndroidEvent::ForegroundAppChanged { .. } => {
+                    let Some(AndroidObservationProvenance::AospPlatformEvent { source }) =
+                        wire.provenance.as_ref()
+                    else {
+                        return Err(serde::de::Error::custom(
+                            "AospPlatform foreground observations require AospPlatformEvent provenance",
+                        ));
+                    };
+                    validate_aosp_platform_event_source(source, AOSP_FOREGROUND_OBSERVER_SERVICE)
+                        .map_err(serde::de::Error::custom)?;
+                }
+                AndroidEvent::BackgroundSupervisorHeartbeat { .. } => {
+                    let Some(AndroidObservationProvenance::AospPlatformEvent { source }) =
+                        wire.provenance.as_ref()
+                    else {
+                        return Err(serde::de::Error::custom(
+                            "AospPlatform background supervisor observations require AospPlatformEvent provenance",
+                        ));
+                    };
+                    validate_aosp_platform_event_source(source, AOSP_BACKGROUND_SUPERVISOR_SERVICE)
+                        .map_err(serde::de::Error::custom)?;
+                }
                 AndroidEvent::ForegroundObservationUnavailable { .. }
-            )
-        ) && matches!(
-            wire.provenance,
-            Some(AndroidObservationProvenance::AospPlatformEvent { .. })
-        ) {
-            return Err(serde::de::Error::custom(
-                "AospPlatformEvent provenance is only valid for AOSP platform foreground success",
-            ));
+                | AndroidEvent::BackgroundSupervisorUnavailable { .. }
+                    if matches!(
+                        wire.provenance,
+                        Some(AndroidObservationProvenance::AospPlatformEvent { .. })
+                    ) =>
+                {
+                    return Err(serde::de::Error::custom(
+                        "AospPlatformEvent provenance is only valid for AOSP platform success observations",
+                    ));
+                }
+                _ => {}
+            }
         }
 
         Ok(Self {
@@ -407,12 +432,21 @@ pub struct AospPlatformEventSource {
 }
 
 pub const AOSP_FOREGROUND_OBSERVER_SERVICE: &str = "fawx-system-foreground-observer";
+pub const AOSP_BACKGROUND_SUPERVISOR_SERVICE: &str = "fawx-system-background-supervisor";
 
 /// Foreground state emitted by a real AOSP/system adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AospForegroundEvent {
     pub package_name: String,
     pub activity_name: Option<String>,
+    pub source: AospPlatformEventSource,
+}
+
+/// Heartbeat emitted by a real AOSP/system background supervisor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AospBackgroundSupervisorEvent {
+    pub supervisor_id: String,
+    pub active_tasks: u32,
     pub source: AospPlatformEventSource,
 }
 
@@ -747,6 +781,21 @@ pub fn aosp_platform_adapter_unavailable_observation(target: &str) -> AndroidObs
     }
 }
 
+pub fn aosp_background_supervisor_unavailable_observation(target: &str) -> AndroidObservation {
+    AndroidObservation {
+        substrate: AndroidSubstrate::AospPlatform,
+        event: AndroidEvent::BackgroundSupervisorUnavailable {
+            target: target.to_string(),
+            reason: AndroidBackgroundSupervisorUnavailableReason::AdapterUnavailable,
+            raw_source: Some(
+                "AOSP background supervisor is not connected; adb/recon processes must stay on ReconRootedStock"
+                    .to_string(),
+            ),
+        },
+        provenance: None,
+    }
+}
+
 pub fn aosp_foreground_observation_from_platform_event(
     event: AospForegroundEvent,
 ) -> Result<AndroidObservation, String> {
@@ -777,16 +826,51 @@ fn validate_aosp_foreground_event(event: &AospForegroundEvent) -> Result<(), Str
         validate_nonempty_token("AOSP foreground activity", activity_name)?;
         validate_no_surrounding_whitespace("AOSP foreground activity", activity_name)?;
     }
-    validate_aosp_platform_event_source(&event.source)?;
+    validate_aosp_platform_event_source(&event.source, AOSP_FOREGROUND_OBSERVER_SERVICE)?;
     Ok(())
 }
 
-fn validate_aosp_platform_event_source(source: &AospPlatformEventSource) -> Result<(), String> {
+pub fn aosp_background_supervisor_observation_from_platform_event(
+    event: AospBackgroundSupervisorEvent,
+) -> Result<AndroidObservation, String> {
+    validate_aosp_background_supervisor_event(&event)?;
+    let source = event.source.clone();
+    Ok(AndroidObservation {
+        substrate: AndroidSubstrate::AospPlatform,
+        event: AndroidEvent::BackgroundSupervisorHeartbeat {
+            supervisor_id: event.supervisor_id,
+            active_tasks: event.active_tasks,
+        },
+        provenance: Some(AndroidObservationProvenance::AospPlatformEvent { source }),
+    })
+}
+
+pub fn aosp_background_supervisor_observation_from_platform_event_json(
+    event_json: &str,
+) -> Result<AndroidObservation, String> {
+    let event = serde_json::from_str::<AospBackgroundSupervisorEvent>(event_json)
+        .map_err(|error| format!("failed to decode AOSP background supervisor event: {error}"))?;
+    aosp_background_supervisor_observation_from_platform_event(event)
+}
+
+fn validate_aosp_background_supervisor_event(
+    event: &AospBackgroundSupervisorEvent,
+) -> Result<(), String> {
+    validate_nonempty_token("AOSP background supervisor id", &event.supervisor_id)?;
+    validate_no_surrounding_whitespace("AOSP background supervisor id", &event.supervisor_id)?;
+    validate_aosp_platform_event_source(&event.source, AOSP_BACKGROUND_SUPERVISOR_SERVICE)?;
+    Ok(())
+}
+
+fn validate_aosp_platform_event_source(
+    source: &AospPlatformEventSource,
+    expected_service_name: &str,
+) -> Result<(), String> {
     validate_nonempty_token("AOSP platform service name", &source.service_name)?;
     validate_no_surrounding_whitespace("AOSP platform service name", &source.service_name)?;
-    if source.service_name != AOSP_FOREGROUND_OBSERVER_SERVICE {
+    if source.service_name != expected_service_name {
         return Err(format!(
-            "AOSP platform service name must be {AOSP_FOREGROUND_OBSERVER_SERVICE}"
+            "AOSP platform service name must be {expected_service_name}"
         ));
     }
     validate_nonempty_token("AOSP platform event id", &source.event_id)?;
@@ -1671,6 +1755,86 @@ mod tests {
     }
 
     #[test]
+    fn aosp_background_supervisor_event_converts_with_provenance() {
+        let observation = aosp_background_supervisor_observation_from_platform_event(
+            AospBackgroundSupervisorEvent {
+                supervisor_id: "supervisor-1".to_string(),
+                active_tasks: 2,
+                source: AospPlatformEventSource {
+                    service_name: AOSP_BACKGROUND_SUPERVISOR_SERVICE.to_string(),
+                    event_id: "event-1".to_string(),
+                },
+            },
+        )
+        .expect("background supervisor event should convert");
+
+        assert_eq!(observation.substrate, AndroidSubstrate::AospPlatform);
+        assert_eq!(
+            observation.event,
+            AndroidEvent::BackgroundSupervisorHeartbeat {
+                supervisor_id: "supervisor-1".to_string(),
+                active_tasks: 2,
+            }
+        );
+        assert_eq!(
+            observation.provenance,
+            Some(AndroidObservationProvenance::AospPlatformEvent {
+                source: AospPlatformEventSource {
+                    service_name: AOSP_BACKGROUND_SUPERVISOR_SERVICE.to_string(),
+                    event_id: "event-1".to_string(),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn aosp_background_supervisor_event_rejects_recon_sources() {
+        let error = aosp_background_supervisor_observation_from_platform_event(
+            AospBackgroundSupervisorEvent {
+                supervisor_id: "supervisor-1".to_string(),
+                active_tasks: 2,
+                source: AospPlatformEventSource {
+                    service_name: "adb".to_string(),
+                    event_id: "event-1".to_string(),
+                },
+            },
+        )
+        .expect_err("adb source should reject");
+
+        assert!(error.contains(AOSP_BACKGROUND_SUPERVISOR_SERVICE));
+    }
+
+    #[test]
+    fn aosp_background_supervisor_event_json_decodes_to_platform_observation() {
+        let observation = aosp_background_supervisor_observation_from_platform_event_json(
+            r#"{
+                "supervisor_id": "supervisor-1",
+                "active_tasks": 2,
+                "source": {
+                    "service_name": "fawx-system-background-supervisor",
+                    "event_id": "event-123"
+                }
+            }"#,
+        )
+        .expect("valid platform event json should produce observation");
+
+        assert_eq!(observation.substrate, AndroidSubstrate::AospPlatform);
+        assert!(matches!(
+            observation.event,
+            AndroidEvent::BackgroundSupervisorHeartbeat {
+                supervisor_id,
+                active_tasks: 2,
+            } if supervisor_id == "supervisor-1"
+        ));
+        assert!(matches!(
+            observation.provenance,
+            Some(AndroidObservationProvenance::AospPlatformEvent { source })
+                if source.service_name == AOSP_BACKGROUND_SUPERVISOR_SERVICE
+                    && source.event_id == "event-123"
+        ));
+    }
+
+    #[test]
     fn android_observation_deserialization_rejects_forged_aosp_foreground_success() {
         let json = serde_json::json!({
             "substrate": "AospPlatform",
@@ -1747,6 +1911,54 @@ mod tests {
             .expect_err("shell-like provenance rejected");
 
         assert!(error.to_string().contains(AOSP_FOREGROUND_OBSERVER_SERVICE));
+    }
+
+    #[test]
+    fn android_observation_deserialization_requires_background_supervisor_provenance() {
+        let json = serde_json::json!({
+            "substrate": "AospPlatform",
+            "event": {
+                "BackgroundSupervisorHeartbeat": {
+                    "supervisor_id": "supervisor-1",
+                    "active_tasks": 2
+                }
+            }
+        });
+
+        let error =
+            serde_json::from_value::<AndroidObservation>(json).expect_err("forged AOSP rejected");
+
+        assert!(error.to_string().contains("provenance"));
+    }
+
+    #[test]
+    fn android_observation_deserialization_allows_background_supervisor_with_provenance() {
+        let json = serde_json::json!({
+            "substrate": "AospPlatform",
+            "event": {
+                "BackgroundSupervisorHeartbeat": {
+                    "supervisor_id": "supervisor-1",
+                    "active_tasks": 2
+                }
+            },
+            "provenance": {
+                "AospPlatformEvent": {
+                    "source": {
+                        "service_name": AOSP_BACKGROUND_SUPERVISOR_SERVICE,
+                        "event_id": "event-1"
+                    }
+                }
+            }
+        });
+
+        let observation =
+            serde_json::from_value::<AndroidObservation>(json).expect("provenance is valid");
+
+        assert_eq!(observation.substrate, AndroidSubstrate::AospPlatform);
+        assert!(matches!(
+            observation.event,
+            AndroidEvent::BackgroundSupervisorHeartbeat { .. }
+        ));
     }
 
     #[test]
