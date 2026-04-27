@@ -50,6 +50,13 @@ So the repo architecture should assume:
 - minimal reliance on Lineage-specific behavior
 - Android as temporary substrate, not permanent identity
 
+This is a hypothesis, not a religion. `docs/architecture/aosp-escape-analysis.md`
+defines the evidence test for whether AOSP is actually liberating enough for an
+agent-native phone OS. If AOSP cannot provide fine-grained typed control over
+foreground state, background execution, notifications, telephony, messaging,
+storage, and local model access, we should treat that as data in favor of a
+different Linux-based foundation.
+
 ## Why Rust
 
 Rust is the right center of gravity for this system because it supports:
