@@ -186,6 +186,9 @@ enum TerminalSessionCommand {
         package_name: String,
         candidate: Box<IntentCandidate>,
     },
+    ApprovePendingIntent {
+        task_id: Option<String>,
+    },
     Help,
     List,
     Quit,
@@ -370,10 +373,13 @@ fn run_terminal_session(store: &TaskStore) -> Result<(), Box<dyn Error>> {
     println!(
         "Local model: not connected yet. This session uses deterministic typed intent parsing."
     );
-    println!("Try: open settings, open launcher, open package <android.package>, list, help, quit");
+    println!(
+        "Try: open settings, suggest open settings, approve last, open launcher, list, help, quit"
+    );
 
     let interpreter = DeterministicSessionInterpreter;
     let mut turn_index = 0_u64;
+    let mut last_pending_approval_task_id: Option<String> = None;
     loop {
         print!("fawx› ");
         io::stdout().flush()?;
@@ -398,10 +404,35 @@ fn run_terminal_session(store: &TaskStore) -> Result<(), Box<dyn Error>> {
                     },
             }) => {
                 turn_index += 1;
-                if let Err(error) =
-                    run_session_open_app(store, turn_index, source, &label, *candidate)
+                match run_session_open_app(store, turn_index, source, &label, *candidate) {
+                    Ok(SessionOpenAppOutcome::Completed) => {}
+                    Ok(SessionOpenAppOutcome::PendingApproval { task_id }) => {
+                        last_pending_approval_task_id = Some(task_id);
+                    }
+                    Err(error) => println!("blocked: {error}"),
+                }
+            }
+            Ok(TerminalSessionIntent {
+                source,
+                command: TerminalSessionCommand::ApprovePendingIntent { task_id },
+            }) => {
+                if source != TerminalSessionIntentSource::OwnerCommand {
+                    println!("blocked: approval commands require direct owner input");
+                    continue;
+                }
+                let Some(task_id) = task_id.or_else(|| last_pending_approval_task_id.clone())
+                else {
+                    println!(
+                        "blocked: no pending approval task; try `suggest open settings` first"
+                    );
+                    continue;
+                };
+                turn_index += 1;
+                if let Err(error) = run_session_approve_pending_intent(store, &task_id, turn_index)
                 {
                     println!("blocked: {error}");
+                } else if last_pending_approval_task_id.as_deref() == Some(task_id.as_str()) {
+                    last_pending_approval_task_id = None;
                 }
             }
             Ok(TerminalSessionIntent {
@@ -430,7 +461,7 @@ fn run_session_open_app(
     source: TerminalSessionIntentSource,
     label: &str,
     candidate: IntentCandidate,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<SessionOpenAppOutcome, Box<dyn Error>> {
     let task_id = session_task_id(turn_index)?;
     let objective = format!("open {label}");
     store.create(TaskState::new_background_task(&task_id, objective))?;
@@ -467,7 +498,8 @@ fn run_session_open_app(
                     .map(|handoff| handoff.reason.as_str())
                     .unwrap_or("owner approval required")
             );
-            return Ok(());
+            println!("approve with: approve {task_id}");
+            return Ok(SessionOpenAppOutcome::PendingApproval { task_id });
         }
     }
 
@@ -520,7 +552,104 @@ fn run_session_open_app(
             println!("waiting: task has no current action after execution");
         }
     }
+    Ok(SessionOpenAppOutcome::Completed)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionOpenAppOutcome {
+    Completed,
+    PendingApproval { task_id: String },
+}
+
+fn run_session_approve_pending_intent(
+    store: &TaskStore,
+    task_id: &str,
+    turn_index: u64,
+) -> Result<(), Box<dyn Error>> {
+    let accepted =
+        accept_pending_intent_approval(store, task_id, "approved from terminal session")?;
+    println!(
+        "accepted: {}",
+        describe_current_action_status(&accepted.state)
+    );
+    let label = current_action_label(&accepted.state);
+    let execution = execute_action(store, task_id)?;
+    println!(
+        "executed: {}",
+        if execution.execution.success {
+            "runtime launch command succeeded"
+        } else {
+            "runtime launch command failed"
+        }
+    );
+
+    let task = poll_session_foreground_until_closed(
+        store,
+        task_id,
+        turn_index,
+        10,
+        Duration::from_millis(250),
+        || foreground_observation(AndroidSubstrate::ReconRootedStock),
+        thread::sleep,
+    )?;
+
+    match task
+        .state
+        .current_action
+        .as_ref()
+        .map(|action| action.status)
+    {
+        Some(AgentActionStatus::Observed) => println!("done: {label} is foreground"),
+        Some(status) => {
+            println!("waiting: action is {status:?}; foreground did not settle before timeout");
+        }
+        None => println!("waiting: task has no current action after approval"),
+    }
     Ok(())
+}
+
+fn accept_pending_intent_approval(
+    store: &TaskStore,
+    task_id: &str,
+    summary: &str,
+) -> Result<StoredTask, Box<dyn Error>> {
+    let task = store.load(task_id)?;
+    let Some(handoff_id) = task
+        .state
+        .current_handoff
+        .as_ref()
+        .map(|handoff| handoff.id.clone())
+    else {
+        return Err(format!("task {task_id} has no active handoff").into());
+    };
+    if task.state.pending_intent_approval.is_none() {
+        return Err(format!("task {task_id} has no pending intent approval").into());
+    }
+
+    Ok(AgentLoop::new(store.clone())
+        .step(LoopStepRequest {
+            task_id: task_id.to_string(),
+            observations: vec![handoff_completion_observation(
+                handoff_id,
+                summary.to_string(),
+            )],
+            expected_foreground_package: None,
+            model_activity: None,
+            model_action: None,
+        })?
+        .task)
+}
+
+fn current_action_label(state: &TaskState) -> String {
+    match state
+        .current_action
+        .as_ref()
+        .and_then(|action| action.target.as_ref())
+    {
+        Some(AgentActivityTarget::AndroidPackage { package_name }) => package_name.clone(),
+        Some(target) => format!("{target:?}"),
+        None => "approved action".to_string(),
+    }
 }
 
 fn terminal_session_authority(source: TerminalSessionIntentSource) -> IntentCandidateAuthority {
@@ -596,6 +725,30 @@ fn session_action_is_closed(state: &TaskState) -> bool {
 
 impl DeterministicSessionInterpreter {
     fn interpret(&self, input: &str, turn_index: u64) -> Result<TerminalSessionIntent, String> {
+        let trimmed = input.trim();
+        for prefix in ["suggest ", "model "] {
+            if let Some(prompt) = trimmed.strip_prefix(prefix) {
+                if matches!(
+                    parse_terminal_session_command_target(prompt),
+                    Ok(ParsedTerminalSessionCommand::ApprovePendingIntent { .. })
+                ) {
+                    return Err(
+                        "model candidates cannot approve pending owner handoffs".to_string()
+                    );
+                }
+                return Ok(TerminalSessionIntent {
+                    source: TerminalSessionIntentSource::ModelCandidate,
+                    command: parse_terminal_session_command_with_provider(
+                        prompt,
+                        turn_index,
+                        LocalModelProviderRef {
+                            provider_id: "terminal-model-candidate".to_string(),
+                            locality: LocalModelLocality::DeviceLocal,
+                        },
+                    )?,
+                });
+            }
+        }
         Ok(TerminalSessionIntent {
             source: TerminalSessionIntentSource::OwnerCommand,
             command: parse_terminal_session_command(input, turn_index)?,
@@ -637,6 +790,9 @@ fn parse_terminal_session_command_with_provider(
         ),
         ParsedTerminalSessionCommand::Help => TerminalSessionCommand::Help,
         ParsedTerminalSessionCommand::List => TerminalSessionCommand::List,
+        ParsedTerminalSessionCommand::ApprovePendingIntent { task_id } => {
+            TerminalSessionCommand::ApprovePendingIntent { task_id }
+        }
         ParsedTerminalSessionCommand::Quit => TerminalSessionCommand::Quit,
     })
 }
@@ -644,6 +800,7 @@ fn parse_terminal_session_command_with_provider(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParsedTerminalSessionCommand {
     OpenApp { label: String, package_name: String },
+    ApprovePendingIntent { task_id: Option<String> },
     Help,
     List,
     Quit,
@@ -662,6 +819,9 @@ fn parse_terminal_session_command_target(
         "quit" | "exit" | ":q" => return Ok(ParsedTerminalSessionCommand::Quit),
         "help" | "?" => return Ok(ParsedTerminalSessionCommand::Help),
         "list" | "tasks" | "status" => return Ok(ParsedTerminalSessionCommand::List),
+        "approve" | "approve last" => {
+            return Ok(ParsedTerminalSessionCommand::ApprovePendingIntent { task_id: None });
+        }
         "open settings" | "launch settings" => {
             return Ok(ParsedTerminalSessionCommand::OpenApp {
                 label: "Settings".to_string(),
@@ -675,6 +835,16 @@ fn parse_terminal_session_command_target(
             });
         }
         _ => {}
+    }
+
+    if let Some(task_id) = trimmed.strip_prefix("approve ") {
+        let task_id = task_id.trim();
+        if task_id.is_empty() {
+            return Err("approve requires `last` or a task id".to_string());
+        }
+        return Ok(ParsedTerminalSessionCommand::ApprovePendingIntent {
+            task_id: Some(task_id.to_string()),
+        });
     }
 
     for prefix in [
@@ -765,6 +935,9 @@ fn open_app_intent_candidate(
 fn print_terminal_session_help() {
     println!("supported prompts:");
     println!("  open settings");
+    println!("  suggest open settings");
+    println!("  approve last");
+    println!("  approve <task-id>");
     println!("  open launcher");
     println!("  open package <android.package>");
     println!("  list");
@@ -862,7 +1035,8 @@ fn model_candidate_intent(prompt: &str, turn_index: u64) -> Result<TerminalSessi
 fn candidate_dry_run_json(intent: &TerminalSessionIntent) -> Result<String, serde_json::Error> {
     let candidate = match &intent.command {
         TerminalSessionCommand::OpenApp { candidate, .. } => serde_json::to_value(candidate)?,
-        TerminalSessionCommand::Help
+        TerminalSessionCommand::ApprovePendingIntent { .. }
+        | TerminalSessionCommand::Help
         | TerminalSessionCommand::List
         | TerminalSessionCommand::Quit => serde_json::Value::Null,
     };
@@ -880,7 +1054,8 @@ fn candidate_dry_run_json(intent: &TerminalSessionIntent) -> Result<String, serd
                 }),
             }
         }
-        TerminalSessionCommand::Help
+        TerminalSessionCommand::ApprovePendingIntent { .. }
+        | TerminalSessionCommand::Help
         | TerminalSessionCommand::List
         | TerminalSessionCommand::Quit => serde_json::Value::Null,
     };
@@ -1985,6 +2160,91 @@ mod tests {
         ));
         assert!(task.state.current_handoff.is_some());
         assert!(task.state.pending_intent_approval.is_some());
+    }
+
+    #[test]
+    fn approving_pending_model_candidate_accepts_same_action_without_model_retry() {
+        let store = test_store();
+        let candidate = open_app_intent_candidate(
+            "Settings",
+            "com.android.settings",
+            "candidate-1".to_string(),
+            LocalModelProviderRef {
+                provider_id: "pixel-aicore-candidate".to_string(),
+                locality: LocalModelLocality::DeviceLocal,
+            },
+            "open settings",
+        );
+
+        let outcome = run_session_open_app(
+            &store,
+            1,
+            TerminalSessionIntentSource::ModelCandidate,
+            "Settings",
+            candidate,
+        )
+        .expect("model candidate should pause");
+        let SessionOpenAppOutcome::PendingApproval { task_id } = outcome else {
+            panic!("expected pending approval");
+        };
+
+        let task =
+            accept_pending_intent_approval(&store, &task_id, "approved").expect("approve pending");
+
+        assert!(task.state.pending_intent_approval.is_none());
+        assert!(task.state.current_handoff.is_none());
+        assert!(
+            task.state
+                .contract
+                .allows(&fawx_kernel::SafetyRequirement::new(
+                    SafetyCapability::AppControl,
+                    SafetyScope::AndroidPackage {
+                        package_name: "com.android.settings".to_string(),
+                    }
+                ))
+        );
+        let action = task.state.current_action.expect("accepted action");
+        assert_eq!(action.status, AgentActionStatus::Accepted);
+        assert_eq!(
+            action.boundary.id,
+            "intent-candidate:pixel-aicore-candidate:candidate-1"
+        );
+    }
+
+    #[test]
+    fn terminal_session_interpreter_supports_model_suggestions() {
+        let intent = DeterministicSessionInterpreter
+            .interpret("suggest open settings", 8)
+            .expect("parse model suggestion");
+
+        assert_eq!(intent.source, TerminalSessionIntentSource::ModelCandidate);
+        let TerminalSessionCommand::OpenApp { candidate, .. } = intent.command else {
+            panic!("expected open app command");
+        };
+        assert_eq!(candidate.candidate_id, "session-turn-8");
+        assert_eq!(candidate.provider.provider_id, "terminal-model-candidate");
+    }
+
+    #[test]
+    fn terminal_session_parser_supports_approval_commands() {
+        assert!(matches!(
+            parse_terminal_session_command("approve last", 1).expect("parse approve last"),
+            TerminalSessionCommand::ApprovePendingIntent { task_id: None }
+        ));
+        assert!(matches!(
+            parse_terminal_session_command("approve task-123", 1).expect("parse approve task"),
+            TerminalSessionCommand::ApprovePendingIntent { task_id: Some(task_id) }
+                if task_id == "task-123"
+        ));
+    }
+
+    #[test]
+    fn terminal_session_rejects_model_sourced_approval_commands() {
+        let error = DeterministicSessionInterpreter
+            .interpret("suggest approve last", 1)
+            .expect_err("model approval must reject");
+
+        assert!(error.contains("model candidates cannot approve"));
     }
 
     #[test]

@@ -19,6 +19,7 @@ This list tracks the remaining gates before we can call the rooted Android proto
 - Pixel local-model reconnaissance can report AICore/Gemini package presence without claiming an inference API.
 - The terminal session now routes deterministic prompts through the `IntentCandidate` seam, preserving provider/candidate provenance before policy acceptance.
 - Candidate acceptance policy exists: owner commands and model candidates are evaluated differently, and unauthorized model candidates pause with a typed owner-approval handoff instead of executing or failing opaquely.
+- Interactive terminal sessions can now exercise a model-candidate approval path end-to-end: `suggest ...` pauses, `approve ...` consumes the stored candidate, execution runs, and foreground evidence closes the action.
 
 ## Remaining
 
