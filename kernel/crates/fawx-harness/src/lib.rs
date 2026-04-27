@@ -38,6 +38,7 @@ pub enum ForegroundUnavailableReason {
     CommandFailed,
     EmptyOutput,
     ParseFailed,
+    AdapterUnavailable,
     Unsupported,
 }
 

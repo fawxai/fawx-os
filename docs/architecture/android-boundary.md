@@ -214,6 +214,27 @@ This table is mirrored as typed data in `fawx-android-adapter` so tests and runt
 | System settings | Limited | Available | Recon can inspect or poke some settings; production needs typed framework APIs. |
 | Root shell | Limited | Unavailable | Root shell is a recon escape hatch, not a production OS primitive. |
 
+## AOSP Comparison Probe
+
+The Android probe is substrate-selectable:
+
+```sh
+fawx-android-probe --substrate recon-rooted-stock
+fawx-android-probe --substrate aosp-platform
+```
+
+`ReconRootedStock` is allowed to run shell-backed commands such as `dumpsys`
+because its purpose is evidence gathering on the current rooted Pixel.
+
+`AospPlatform` is different. Until a privileged platform adapter exists, the
+probe must not relabel shell evidence as AOSP/system evidence. It may emit the
+typed AOSP capability projection, but platform observations should report an
+explicit `AdapterUnavailable` result. This keeps the comparison honest:
+
+- rooted stock tells us what can be proven through recon today
+- AOSP platform tells us what the eventual system adapter must own
+- the delta between them tells us whether moving into AOSP is justified
+
 ## Minimum First-Implementation Contract
 
 For the first Android boundary implementation, we need:
