@@ -286,6 +286,21 @@ pub enum AndroidEvent {
         reason: AndroidNotificationUnavailableReason,
         raw_source: Option<String>,
     },
+    NotificationPostUnavailable {
+        target: String,
+        reason: AndroidNotificationPostUnavailableReason,
+        raw_source: Option<String>,
+    },
+    MessageUnavailable {
+        target: String,
+        reason: AndroidMessageUnavailableReason,
+        raw_source: Option<String>,
+    },
+    PhoneCallUnavailable {
+        target: String,
+        reason: AndroidPhoneCallUnavailableReason,
+        raw_source: Option<String>,
+    },
     TargetSurfaceBecameUnavailable {
         target: String,
     },
@@ -325,6 +340,21 @@ pub enum AndroidAppLaunchUnavailableReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AndroidNotificationUnavailableReason {
+    AdapterUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AndroidNotificationPostUnavailableReason {
+    AdapterUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AndroidMessageUnavailableReason {
+    AdapterUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AndroidPhoneCallUnavailableReason {
     AdapterUnavailable,
 }
 
@@ -442,6 +472,9 @@ impl<'de> Deserialize<'de> for AndroidObservation {
                 | AndroidEvent::BackgroundSupervisorUnavailable { .. }
                 | AndroidEvent::AppLaunchUnavailable { .. }
                 | AndroidEvent::NotificationUnavailable { .. }
+                | AndroidEvent::NotificationPostUnavailable { .. }
+                | AndroidEvent::MessageUnavailable { .. }
+                | AndroidEvent::PhoneCallUnavailable { .. }
                     if matches!(
                         wire.provenance,
                         Some(AndroidObservationProvenance::AospPlatformEvent { .. })
@@ -885,6 +918,51 @@ pub fn aosp_notification_unavailable_observation(target: &str) -> AndroidObserva
             reason: AndroidNotificationUnavailableReason::AdapterUnavailable,
             raw_source: Some(
                 "AOSP notification listener is not connected; notification reads must come from a platform listener"
+                    .to_string(),
+            ),
+        },
+        provenance: None,
+    }
+}
+
+pub fn aosp_notification_post_unavailable_observation(target: &str) -> AndroidObservation {
+    AndroidObservation {
+        substrate: AndroidSubstrate::AospPlatform,
+        event: AndroidEvent::NotificationPostUnavailable {
+            target: target.to_string(),
+            reason: AndroidNotificationPostUnavailableReason::AdapterUnavailable,
+            raw_source: Some(
+                "AOSP notification poster is not connected; notification posts must come from a platform poster"
+                    .to_string(),
+            ),
+        },
+        provenance: None,
+    }
+}
+
+pub fn aosp_message_unavailable_observation(target: &str) -> AndroidObservation {
+    AndroidObservation {
+        substrate: AndroidSubstrate::AospPlatform,
+        event: AndroidEvent::MessageUnavailable {
+            target: target.to_string(),
+            reason: AndroidMessageUnavailableReason::AdapterUnavailable,
+            raw_source: Some(
+                "AOSP messaging adapter is not connected; message sends must come from a platform messaging service"
+                    .to_string(),
+            ),
+        },
+        provenance: None,
+    }
+}
+
+pub fn aosp_phone_call_unavailable_observation(target: &str) -> AndroidObservation {
+    AndroidObservation {
+        substrate: AndroidSubstrate::AospPlatform,
+        event: AndroidEvent::PhoneCallUnavailable {
+            target: target.to_string(),
+            reason: AndroidPhoneCallUnavailableReason::AdapterUnavailable,
+            raw_source: Some(
+                "AOSP telephony adapter is not connected; phone calls must come from a platform telephony service"
                     .to_string(),
             ),
         },
@@ -2369,6 +2447,83 @@ mod tests {
             observation.event,
             AndroidEvent::NotificationReceived { .. }
         ));
+    }
+
+    #[test]
+    fn aosp_sensitive_action_unavailable_events_have_no_success_provenance() {
+        let observations = [
+            aosp_notification_post_unavailable_observation("notification-post"),
+            aosp_message_unavailable_observation("messaging"),
+            aosp_phone_call_unavailable_observation("phone-call"),
+        ];
+
+        for observation in observations {
+            assert_eq!(observation.substrate, AndroidSubstrate::AospPlatform);
+            assert_eq!(observation.provenance, None);
+            match observation.event {
+                AndroidEvent::NotificationPostUnavailable {
+                    reason: AndroidNotificationPostUnavailableReason::AdapterUnavailable,
+                    ..
+                }
+                | AndroidEvent::MessageUnavailable {
+                    reason: AndroidMessageUnavailableReason::AdapterUnavailable,
+                    ..
+                }
+                | AndroidEvent::PhoneCallUnavailable {
+                    reason: AndroidPhoneCallUnavailableReason::AdapterUnavailable,
+                    ..
+                } => {}
+                other => panic!("unexpected unavailable observation: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn android_observation_deserialization_rejects_aosp_success_provenance_on_sensitive_unavailable_events()
+     {
+        let event_payloads = [
+            serde_json::json!({
+                "NotificationPostUnavailable": {
+                    "target": "notification-post",
+                    "reason": "AdapterUnavailable",
+                    "raw_source": "not connected"
+                }
+            }),
+            serde_json::json!({
+                "MessageUnavailable": {
+                    "target": "messaging",
+                    "reason": "AdapterUnavailable",
+                    "raw_source": "not connected"
+                }
+            }),
+            serde_json::json!({
+                "PhoneCallUnavailable": {
+                    "target": "phone-call",
+                    "reason": "AdapterUnavailable",
+                    "raw_source": "not connected"
+                }
+            }),
+        ];
+
+        for event in event_payloads {
+            let json = serde_json::json!({
+                "substrate": "AospPlatform",
+                "event": event,
+                "provenance": {
+                    "AospPlatformEvent": {
+                        "source": {
+                            "service_name": "fawx-system-test",
+                            "event_id": "event-1"
+                        }
+                    }
+                }
+            });
+
+            let error = serde_json::from_value::<AndroidObservation>(json)
+                .expect_err("unavailable events cannot carry success provenance");
+
+            assert!(error.to_string().contains("success observations"));
+        }
     }
 
     #[test]

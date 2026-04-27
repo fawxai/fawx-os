@@ -54,6 +54,9 @@ assert_json "$aosp_output" '[.observations[] | select(.android_observation.event
 assert_json "$aosp_output" '[.observations[] | select(.android_observation.event.AppLaunchCompleted != null)] | length == 0' "AOSP probe emits no recon-backed app launch success"
 assert_json "$aosp_output" '[.observations[] | select(.android_observation.event.NotificationUnavailable.reason == "AdapterUnavailable")] | length == 1' "AOSP notification read is explicitly unavailable"
 assert_json "$aosp_output" '[.observations[] | select(.android_observation.event.NotificationReceived != null)] | length == 0' "AOSP probe emits no recon-backed notification success"
+assert_json "$aosp_output" '[.observations[] | select(.android_observation.event.NotificationPostUnavailable.reason == "AdapterUnavailable")] | length == 1' "AOSP notification post is explicitly unavailable"
+assert_json "$aosp_output" '[.observations[] | select(.android_observation.event.MessageUnavailable.reason == "AdapterUnavailable")] | length == 1' "AOSP messaging is explicitly unavailable"
+assert_json "$aosp_output" '[.observations[] | select(.android_observation.event.PhoneCallUnavailable.reason == "AdapterUnavailable")] | length == 1' "AOSP phone calling is explicitly unavailable"
 assert_json "$aosp_output" '[.capability_statuses[] | select(.capability == "PlaceCall" and .status == "Available")] | length == 1' "AOSP probe shows privileged platform capabilities from typed map"
 assert_json "$aosp_output" '[.capability_statuses[] | select(.capability == "RootShell" and .status == "Unavailable")] | length == 1' "AOSP probe marks root shell unavailable as a platform primitive"
 

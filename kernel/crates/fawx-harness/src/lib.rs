@@ -75,6 +75,21 @@ pub enum NotificationUnavailableReason {
     AdapterUnavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationPostUnavailableReason {
+    AdapterUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageUnavailableReason {
+    AdapterUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PhoneCallUnavailableReason {
+    AdapterUnavailable,
+}
+
 /// Device-agnostic observations flowing into the harness policy layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeEvent {
@@ -112,6 +127,21 @@ pub enum RuntimeEvent {
     NotificationUnavailable {
         target: String,
         reason: NotificationUnavailableReason,
+        raw_source: Option<String>,
+    },
+    NotificationPostUnavailable {
+        target: String,
+        reason: NotificationPostUnavailableReason,
+        raw_source: Option<String>,
+    },
+    MessageUnavailable {
+        target: String,
+        reason: MessageUnavailableReason,
+        raw_source: Option<String>,
+    },
+    PhoneCallUnavailable {
+        target: String,
+        reason: PhoneCallUnavailableReason,
         raw_source: Option<String>,
     },
     NetworkAvailabilityChanged {
