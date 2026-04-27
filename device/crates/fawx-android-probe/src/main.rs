@@ -1,10 +1,12 @@
 use std::error::Error;
+use std::fs;
 use std::process::ExitCode;
 
 use fawx_android_adapter::{
     AndroidCapabilityStatusEntry, AndroidEvent, AndroidObservation, AndroidReconCommand,
-    AndroidSubstrate, android_capability_statuses, aosp_platform_adapter_unavailable_observation,
-    foreground_observation, run_recon_command,
+    AndroidSubstrate, android_capability_statuses,
+    aosp_foreground_observation_from_platform_event_json,
+    aosp_platform_adapter_unavailable_observation, foreground_observation, run_recon_command,
 };
 use serde::Serialize;
 
@@ -22,7 +24,7 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "usage: fawx-android-probe [--substrate recon-rooted-stock|aosp-platform]";
+const USAGE: &str = "usage: fawx-android-probe [--substrate recon-rooted-stock|aosp-platform] [--aosp-foreground-event-file PATH]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeExit {
@@ -30,48 +32,75 @@ enum ProbeExit {
     Help,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ProbeArgs {
-    Run { substrate: AndroidSubstrate },
+    Run {
+        substrate: AndroidSubstrate,
+        aosp_foreground_event_file: Option<String>,
+    },
     Help,
 }
 
 fn run() -> Result<ProbeExit, Box<dyn Error>> {
-    let ProbeArgs::Run { substrate } = parse_probe_args(std::env::args().skip(1))? else {
+    let ProbeArgs::Run {
+        substrate,
+        aosp_foreground_event_file,
+    } = parse_probe_args(std::env::args().skip(1))?
+    else {
         return Ok(ProbeExit::Help);
     };
     let report = ProbeReport {
         substrate,
         capability_statuses: android_capability_statuses(substrate),
-        observations: probe_observations(substrate),
+        observations: probe_observations(substrate, aosp_foreground_event_file.as_deref()),
     };
 
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(ProbeExit::Success)
 }
 
-fn parse_probe_args<I>(mut args: I) -> Result<ProbeArgs, Box<dyn Error>>
+fn parse_probe_args<I>(args: I) -> Result<ProbeArgs, Box<dyn Error>>
 where
     I: Iterator<Item = String>,
 {
-    let Some(first) = args.next() else {
-        return Ok(ProbeArgs::Run {
-            substrate: AndroidSubstrate::ReconRootedStock,
-        });
-    };
+    let mut substrate = AndroidSubstrate::ReconRootedStock;
+    let mut aosp_foreground_event_file = None;
+    let mut args = args.peekable();
 
-    let value = match first.as_str() {
-        "--substrate" => args.next().ok_or("missing value after --substrate")?,
-        "--help" | "-h" => return Ok(ProbeArgs::Help),
-        value => value.to_string(),
-    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(ProbeArgs::Help),
+            "--substrate" => {
+                let value = args.next().ok_or("missing value after --substrate")?;
+                substrate = value.parse()?;
+            }
+            "--aosp-foreground-event-file" => {
+                let value = args
+                    .next()
+                    .ok_or("missing value after --aosp-foreground-event-file")?;
+                if value.starts_with("--") {
+                    return Err("missing value after --aosp-foreground-event-file".into());
+                }
+                aosp_foreground_event_file = Some(value);
+            }
+            value if value.starts_with("--") => {
+                return Err(format!("unexpected probe option: {value}").into());
+            }
+            value => {
+                substrate = value.parse()?;
+            }
+        }
+    }
 
-    if args.next().is_some() {
-        return Err("unexpected extra arguments".into());
+    if aosp_foreground_event_file.is_some() && substrate != AndroidSubstrate::AospPlatform {
+        return Err(
+            "--aosp-foreground-event-file is only valid with --substrate aosp-platform".into(),
+        );
     }
 
     Ok(ProbeArgs::Run {
-        substrate: value.parse()?,
+        substrate,
+        aosp_foreground_event_file,
     })
 }
 
@@ -90,19 +119,26 @@ struct ProbeObservation {
     android_observation: Option<AndroidObservation>,
 }
 
-fn probe_observations(substrate: AndroidSubstrate) -> Vec<ProbeObservation> {
+fn probe_observations(
+    substrate: AndroidSubstrate,
+    aosp_foreground_event_file: Option<&str>,
+) -> Vec<ProbeObservation> {
     match substrate {
         AndroidSubstrate::ReconRootedStock => vec![
             command_observation("whoami", AndroidReconCommand::Whoami),
             command_observation("id", AndroidReconCommand::Id),
             command_observation("uname", AndroidReconCommand::Uname),
             root_observation(),
-            foreground_probe_observation(substrate),
+            foreground_probe_observation(substrate, AospForegroundEventObservation::Unavailable),
         ],
-        AndroidSubstrate::AospPlatform => vec![
-            aosp_adapter_probe_observation(),
-            foreground_probe_observation(substrate),
-        ],
+        AndroidSubstrate::AospPlatform => {
+            let event_observation =
+                aosp_foreground_event_observation_from_file(aosp_foreground_event_file);
+            vec![
+                aosp_adapter_probe_observation(aosp_foreground_event_file, &event_observation),
+                foreground_probe_observation(substrate, event_observation),
+            ]
+        }
     }
 }
 
@@ -138,21 +174,59 @@ fn root_observation() -> ProbeObservation {
     }
 }
 
-fn aosp_adapter_probe_observation() -> ProbeObservation {
-    ProbeObservation {
-        name: "aosp-platform-adapter".to_string(),
-        ok: false,
-        summary: "AOSP platform adapter is not connected in this terminal binary".to_string(),
-        android_observation: None,
+fn aosp_adapter_probe_observation(
+    aosp_foreground_event_file: Option<&str>,
+    event_observation: &AospForegroundEventObservation,
+) -> ProbeObservation {
+    match (aosp_foreground_event_file, event_observation) {
+        (Some(path), AospForegroundEventObservation::Observed(_)) => ProbeObservation {
+            name: "aosp-platform-adapter".to_string(),
+            ok: true,
+            summary: format!("AOSP foreground event source connected: {path}"),
+            android_observation: None,
+        },
+        (Some(path), AospForegroundEventObservation::Invalid { reason }) => ProbeObservation {
+            name: "aosp-platform-adapter".to_string(),
+            ok: false,
+            summary: format!("AOSP foreground event source invalid: {path}: {reason}"),
+            android_observation: None,
+        },
+        (Some(path), AospForegroundEventObservation::Unavailable) => ProbeObservation {
+            name: "aosp-platform-adapter".to_string(),
+            ok: false,
+            summary: format!("AOSP foreground event source unavailable: {path}"),
+            android_observation: None,
+        },
+        (None, AospForegroundEventObservation::Unavailable) => ProbeObservation {
+            name: "aosp-platform-adapter".to_string(),
+            ok: false,
+            summary: "AOSP platform adapter is not connected in this terminal binary".to_string(),
+            android_observation: None,
+        },
+        (None, _) => ProbeObservation {
+            name: "aosp-platform-adapter".to_string(),
+            ok: false,
+            summary: "AOSP platform adapter state is inconsistent".to_string(),
+            android_observation: None,
+        },
     }
 }
 
-fn foreground_probe_observation(substrate: AndroidSubstrate) -> ProbeObservation {
+fn foreground_probe_observation(
+    substrate: AndroidSubstrate,
+    aosp_foreground_event_observation: AospForegroundEventObservation,
+) -> ProbeObservation {
     let observation = match substrate {
         AndroidSubstrate::ReconRootedStock => foreground_observation(substrate),
-        AndroidSubstrate::AospPlatform => {
-            aosp_platform_adapter_unavailable_observation("foreground")
-        }
+        AndroidSubstrate::AospPlatform => match aosp_foreground_event_observation {
+            AospForegroundEventObservation::Observed(observation) => observation,
+            AospForegroundEventObservation::Invalid { reason } => {
+                return foreground_unavailable(format!("foreground unavailable: {reason}"), None);
+            }
+            AospForegroundEventObservation::Unavailable => {
+                aosp_platform_adapter_unavailable_observation("foreground")
+            }
+        },
     };
 
     match observation.event().clone() {
@@ -190,6 +264,35 @@ fn foreground_probe_observation(substrate: AndroidSubstrate) -> ProbeObservation
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AospForegroundEventObservation {
+    Observed(AndroidObservation),
+    Invalid { reason: String },
+    Unavailable,
+}
+
+fn aosp_foreground_event_observation_from_file(
+    aosp_foreground_event_file: Option<&str>,
+) -> AospForegroundEventObservation {
+    let Some(path) = aosp_foreground_event_file else {
+        return AospForegroundEventObservation::Unavailable;
+    };
+
+    let event_json = match fs::read_to_string(path) {
+        Ok(event_json) => event_json,
+        Err(error) => {
+            return AospForegroundEventObservation::Invalid {
+                reason: format!("failed to read {path}: {error}"),
+            };
+        }
+    };
+
+    match aosp_foreground_observation_from_platform_event_json(&event_json) {
+        Ok(observation) => AospForegroundEventObservation::Observed(observation),
+        Err(error) => AospForegroundEventObservation::Invalid { reason: error },
+    }
+}
+
 fn foreground_unavailable(
     summary: String,
     android_observation: Option<AndroidObservation>,
@@ -213,7 +316,8 @@ mod tests {
         assert_eq!(
             args,
             ProbeArgs::Run {
-                substrate: AndroidSubstrate::ReconRootedStock
+                substrate: AndroidSubstrate::ReconRootedStock,
+                aosp_foreground_event_file: None
             }
         );
     }
@@ -230,9 +334,50 @@ mod tests {
         assert_eq!(
             args,
             ProbeArgs::Run {
-                substrate: AndroidSubstrate::AospPlatform
+                substrate: AndroidSubstrate::AospPlatform,
+                aosp_foreground_event_file: None
             }
         );
+    }
+
+    #[test]
+    fn parses_aosp_foreground_event_file() {
+        let args = parse_probe_args(
+            [
+                "--substrate",
+                "aosp-platform",
+                "--aosp-foreground-event-file",
+                "/run/fawx/foreground.json",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("platform event file should parse");
+
+        assert_eq!(
+            args,
+            ProbeArgs::Run {
+                substrate: AndroidSubstrate::AospPlatform,
+                aosp_foreground_event_file: Some("/run/fawx/foreground.json".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_aosp_foreground_event_file_on_recon_substrate() {
+        let error = parse_probe_args(
+            [
+                "--substrate",
+                "recon-rooted-stock",
+                "--aosp-foreground-event-file",
+                "/run/fawx/foreground.json",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect_err("platform event file must not be accepted on recon substrate");
+
+        assert!(error.to_string().contains("aosp-platform"));
     }
 
     #[test]
@@ -245,7 +390,7 @@ mod tests {
 
     #[test]
     fn aosp_probe_uses_unavailable_platform_observation_until_adapter_exists() {
-        let observations = probe_observations(AndroidSubstrate::AospPlatform);
+        let observations = probe_observations(AndroidSubstrate::AospPlatform, None);
 
         assert!(observations.iter().any(|observation| {
             observation.name == "aosp-platform-adapter"
@@ -260,6 +405,81 @@ mod tests {
                     ..
                 })
             )
+        }));
+    }
+
+    #[test]
+    fn aosp_probe_can_ingest_privileged_foreground_event_file() {
+        let event_path = std::env::temp_dir().join(format!(
+            "fawx-aosp-foreground-event-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &event_path,
+            r#"{
+                "package_name": "com.android.settings",
+                "activity_name": "com.android.settings.Settings",
+                "source": {
+                    "service_name": "fawx-system-foreground-observer",
+                    "event_id": "event-123"
+                }
+            }"#,
+        )
+        .expect("test event should write");
+
+        let observations = probe_observations(
+            AndroidSubstrate::AospPlatform,
+            Some(event_path.to_str().expect("temp path should be utf8")),
+        );
+        let _ = std::fs::remove_file(event_path);
+
+        assert!(observations.iter().any(|observation| {
+            observation.name == "aosp-platform-adapter"
+                && observation.ok
+                && observation.summary.contains("event source connected")
+        }));
+        assert!(observations.iter().any(|observation| {
+            matches!(
+                observation.android_observation.as_ref().map(|value| value.event()),
+                Some(AndroidEvent::ForegroundAppChanged { package_name, .. })
+                    if package_name == "com.android.settings"
+            )
+        }));
+    }
+
+    #[test]
+    fn aosp_probe_marks_invalid_event_file_as_disconnected() {
+        let event_path = std::env::temp_dir().join(format!(
+            "fawx-aosp-invalid-foreground-event-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &event_path,
+            r#"{
+                "package_name": "com.android.settings",
+                "source": {
+                    "service_name": "dumpsys",
+                    "event_id": "event-123"
+                }
+            }"#,
+        )
+        .expect("test event should write");
+
+        let observations = probe_observations(
+            AndroidSubstrate::AospPlatform,
+            Some(event_path.to_str().expect("temp path should be utf8")),
+        );
+        let _ = std::fs::remove_file(event_path);
+
+        assert!(observations.iter().any(|observation| {
+            observation.name == "aosp-platform-adapter"
+                && !observation.ok
+                && observation.summary.contains("invalid")
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.name == "foreground"
+                && !observation.ok
+                && observation.android_observation.is_none()
         }));
     }
 }

@@ -315,6 +315,8 @@ pub enum AndroidCommand {
 pub struct AndroidObservation {
     substrate: AndroidSubstrate,
     event: AndroidEvent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<AndroidObservationProvenance>,
 }
 
 impl AndroidObservation {
@@ -322,6 +324,7 @@ impl AndroidObservation {
         Self {
             substrate: AndroidSubstrate::ReconRootedStock,
             event,
+            provenance: None,
         }
     }
 
@@ -331,6 +334,10 @@ impl AndroidObservation {
 
     pub fn event(&self) -> &AndroidEvent {
         &self.event
+    }
+
+    pub fn provenance(&self) -> Option<&AndroidObservationProvenance> {
+        self.provenance.as_ref()
     }
 }
 
@@ -343,26 +350,49 @@ impl<'de> Deserialize<'de> for AndroidObservation {
         struct WireAndroidObservation {
             substrate: AndroidSubstrate,
             event: AndroidEvent,
+            provenance: Option<AndroidObservationProvenance>,
         }
 
         let wire = WireAndroidObservation::deserialize(deserializer)?;
+        if let (AndroidSubstrate::AospPlatform, AndroidEvent::ForegroundAppChanged { .. }) =
+            (&wire.substrate, &wire.event)
+        {
+            let Some(AndroidObservationProvenance::AospPlatformEvent { source }) =
+                wire.provenance.as_ref()
+            else {
+                return Err(serde::de::Error::custom(
+                    "AospPlatform foreground observations require AospPlatformEvent provenance",
+                ));
+            };
+            validate_aosp_platform_event_source(source).map_err(serde::de::Error::custom)?;
+        }
+
         if matches!(
             (&wire.substrate, &wire.event),
             (
                 AndroidSubstrate::AospPlatform,
-                AndroidEvent::ForegroundAppChanged { .. }
+                AndroidEvent::ForegroundObservationUnavailable { .. }
             )
+        ) && matches!(
+            wire.provenance,
+            Some(AndroidObservationProvenance::AospPlatformEvent { .. })
         ) {
             return Err(serde::de::Error::custom(
-                "AospPlatform foreground observations must be constructed from AospForegroundEvent",
+                "AospPlatformEvent provenance is only valid for AOSP platform foreground success",
             ));
         }
 
         Ok(Self {
             substrate: wire.substrate,
             event: wire.event,
+            provenance: wire.provenance,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AndroidObservationProvenance {
+    AospPlatformEvent { source: AospPlatformEventSource },
 }
 
 /// Provenance for an AOSP platform event.
@@ -375,6 +405,8 @@ pub struct AospPlatformEventSource {
     pub service_name: String,
     pub event_id: String,
 }
+
+pub const AOSP_FOREGROUND_OBSERVER_SERVICE: &str = "fawx-system-foreground-observer";
 
 /// Foreground state emitted by a real AOSP/system adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -711,6 +743,7 @@ pub fn aosp_platform_adapter_unavailable_observation(target: &str) -> AndroidObs
                     .to_string(),
             ),
         },
+        provenance: None,
     }
 }
 
@@ -718,13 +751,23 @@ pub fn aosp_foreground_observation_from_platform_event(
     event: AospForegroundEvent,
 ) -> Result<AndroidObservation, String> {
     validate_aosp_foreground_event(&event)?;
+    let source = event.source.clone();
     Ok(AndroidObservation {
         substrate: AndroidSubstrate::AospPlatform,
         event: AndroidEvent::ForegroundAppChanged {
             package_name: event.package_name,
             activity_name: event.activity_name,
         },
+        provenance: Some(AndroidObservationProvenance::AospPlatformEvent { source }),
     })
+}
+
+pub fn aosp_foreground_observation_from_platform_event_json(
+    event_json: &str,
+) -> Result<AndroidObservation, String> {
+    let event = serde_json::from_str::<AospForegroundEvent>(event_json)
+        .map_err(|error| format!("failed to decode AOSP foreground event: {error}"))?;
+    aosp_foreground_observation_from_platform_event(event)
 }
 
 fn validate_aosp_foreground_event(event: &AospForegroundEvent) -> Result<(), String> {
@@ -734,10 +777,20 @@ fn validate_aosp_foreground_event(event: &AospForegroundEvent) -> Result<(), Str
         validate_nonempty_token("AOSP foreground activity", activity_name)?;
         validate_no_surrounding_whitespace("AOSP foreground activity", activity_name)?;
     }
-    validate_nonempty_token("AOSP platform service name", &event.source.service_name)?;
-    validate_no_surrounding_whitespace("AOSP platform service name", &event.source.service_name)?;
-    validate_nonempty_token("AOSP platform event id", &event.source.event_id)?;
-    validate_no_surrounding_whitespace("AOSP platform event id", &event.source.event_id)?;
+    validate_aosp_platform_event_source(&event.source)?;
+    Ok(())
+}
+
+fn validate_aosp_platform_event_source(source: &AospPlatformEventSource) -> Result<(), String> {
+    validate_nonempty_token("AOSP platform service name", &source.service_name)?;
+    validate_no_surrounding_whitespace("AOSP platform service name", &source.service_name)?;
+    if source.service_name != AOSP_FOREGROUND_OBSERVER_SERVICE {
+        return Err(format!(
+            "AOSP platform service name must be {AOSP_FOREGROUND_OBSERVER_SERVICE}"
+        ));
+    }
+    validate_nonempty_token("AOSP platform event id", &source.event_id)?;
+    validate_no_surrounding_whitespace("AOSP platform event id", &source.event_id)?;
     Ok(())
 }
 
@@ -781,6 +834,7 @@ pub fn foreground_observation_from_result(
                     package_name: target.package_name,
                     activity_name: target.activity_name,
                 },
+                provenance: None,
             },
             None => unavailable_foreground(
                 substrate,
@@ -827,6 +881,7 @@ pub fn foreground_observation_from_output(
                     package_name: target.package_name,
                     activity_name: target.activity_name,
                 },
+                provenance: None,
             },
             None => unavailable_foreground(
                 substrate,
@@ -939,6 +994,7 @@ fn unavailable_foreground(
             reason,
             raw_source,
         },
+        provenance: None,
     }
 }
 
@@ -954,6 +1010,12 @@ mod tests {
                 package_name: "com.android.chrome".to_string(),
                 activity_name: Some("com.google.android.apps.chrome.Main".to_string()),
             },
+            provenance: Some(AndroidObservationProvenance::AospPlatformEvent {
+                source: AospPlatformEventSource {
+                    service_name: AOSP_FOREGROUND_OBSERVER_SERVICE.to_string(),
+                    event_id: "event-1".to_string(),
+                },
+            }),
         };
 
         assert!(matches!(
@@ -992,6 +1054,7 @@ mod tests {
         let observation = AndroidObservation {
             substrate: AndroidSubstrate::ReconRootedStock,
             event: AndroidEvent::NetworkAvailabilityChanged { available: true },
+            provenance: None,
         };
 
         assert_eq!(observation.substrate, AndroidSubstrate::ReconRootedStock);
@@ -1227,6 +1290,7 @@ mod tests {
                 reason: AndroidForegroundUnavailableReason::ParseFailed,
                 raw_source: Some("bad focus line".to_string()),
             },
+            provenance: None,
         };
 
         let json = serde_json::to_value(&observation).expect("serialize observation");
@@ -1483,7 +1547,7 @@ mod tests {
             package_name: "com.android.settings".to_string(),
             activity_name: Some(".Settings".to_string()),
             source: AospPlatformEventSource {
-                service_name: "fawx.platform.ForegroundObserver".to_string(),
+                service_name: AOSP_FOREGROUND_OBSERVER_SERVICE.to_string(),
                 event_id: "event-1".to_string(),
             },
         })
@@ -1496,6 +1560,15 @@ mod tests {
                 package_name: "com.android.settings".to_string(),
                 activity_name: Some(".Settings".to_string())
             }
+        );
+        assert_eq!(
+            observation.provenance,
+            Some(AndroidObservationProvenance::AospPlatformEvent {
+                source: AospPlatformEventSource {
+                    service_name: AOSP_FOREGROUND_OBSERVER_SERVICE.to_string(),
+                    event_id: "event-1".to_string(),
+                },
+            })
         );
     }
 
@@ -1517,7 +1590,7 @@ mod tests {
             package_name: " com.android.settings".to_string(),
             activity_name: None,
             source: AospPlatformEventSource {
-                service_name: "fawx.platform.ForegroundObserver".to_string(),
+                service_name: AOSP_FOREGROUND_OBSERVER_SERVICE.to_string(),
                 event_id: "event-1".to_string(),
             },
         })
@@ -1529,13 +1602,72 @@ mod tests {
             package_name: "com.android.settings".to_string(),
             activity_name: Some(String::new()),
             source: AospPlatformEventSource {
-                service_name: "fawx.platform.ForegroundObserver".to_string(),
+                service_name: AOSP_FOREGROUND_OBSERVER_SERVICE.to_string(),
                 event_id: "event-1".to_string(),
             },
         })
         .expect_err("empty activity should reject");
 
         assert!(error.contains("activity"));
+
+        let error = aosp_foreground_observation_from_platform_event(AospForegroundEvent {
+            package_name: "com.android.settings".to_string(),
+            activity_name: Some(".Settings".to_string()),
+            source: AospPlatformEventSource {
+                service_name: "dumpsys".to_string(),
+                event_id: "event-1".to_string(),
+            },
+        })
+        .expect_err("shell-like event source should reject");
+
+        assert!(error.contains(AOSP_FOREGROUND_OBSERVER_SERVICE));
+    }
+
+    #[test]
+    fn aosp_platform_foreground_event_json_decodes_to_platform_observation() {
+        let observation = aosp_foreground_observation_from_platform_event_json(
+            r#"{
+                "package_name": "com.android.settings",
+                "activity_name": "com.android.settings.Settings",
+                "source": {
+                    "service_name": "fawx-system-foreground-observer",
+                    "event_id": "event-123"
+                }
+            }"#,
+        )
+        .expect("valid platform event json should produce observation");
+
+        assert_eq!(observation.substrate, AndroidSubstrate::AospPlatform);
+        assert!(matches!(
+            observation.event,
+            AndroidEvent::ForegroundAppChanged {
+                package_name,
+                activity_name: Some(activity_name),
+            } if package_name == "com.android.settings"
+                && activity_name == "com.android.settings.Settings"
+        ));
+        assert!(matches!(
+            observation.provenance,
+            Some(AndroidObservationProvenance::AospPlatformEvent { source })
+                if source.service_name == AOSP_FOREGROUND_OBSERVER_SERVICE
+                    && source.event_id == "event-123"
+        ));
+    }
+
+    #[test]
+    fn aosp_platform_foreground_event_json_rejects_invalid_event_shape() {
+        let error = aosp_foreground_observation_from_platform_event_json(
+            r#"{
+                "package_name": " com.android.settings",
+                "source": {
+                    "service_name": "fawx-system-foreground-observer",
+                    "event_id": "event-123"
+                }
+            }"#,
+        )
+        .expect_err("invalid platform event json should be rejected");
+
+        assert!(error.contains("package"));
     }
 
     #[test]
@@ -1553,7 +1685,68 @@ mod tests {
         let error =
             serde_json::from_value::<AndroidObservation>(json).expect_err("forged AOSP rejected");
 
-        assert!(error.to_string().contains("AospForegroundEvent"));
+        assert!(error.to_string().contains("provenance"));
+    }
+
+    #[test]
+    fn android_observation_deserialization_allows_aosp_foreground_with_provenance() {
+        let json = serde_json::json!({
+            "substrate": "AospPlatform",
+            "event": {
+                "ForegroundAppChanged": {
+                    "package_name": "com.android.settings",
+                    "activity_name": ".Settings"
+                }
+            },
+            "provenance": {
+                "AospPlatformEvent": {
+                    "source": {
+                        "service_name": AOSP_FOREGROUND_OBSERVER_SERVICE,
+                        "event_id": "event-1"
+                    }
+                }
+            }
+        });
+
+        let observation =
+            serde_json::from_value::<AndroidObservation>(json).expect("provenance is valid");
+
+        assert_eq!(observation.substrate, AndroidSubstrate::AospPlatform);
+        assert!(matches!(
+            observation.event,
+            AndroidEvent::ForegroundAppChanged { .. }
+        ));
+        assert!(matches!(
+            observation.provenance,
+            Some(AndroidObservationProvenance::AospPlatformEvent { source })
+                if source.service_name == AOSP_FOREGROUND_OBSERVER_SERVICE
+        ));
+    }
+
+    #[test]
+    fn android_observation_deserialization_rejects_shell_like_aosp_provenance() {
+        let json = serde_json::json!({
+            "substrate": "AospPlatform",
+            "event": {
+                "ForegroundAppChanged": {
+                    "package_name": "com.android.settings",
+                    "activity_name": ".Settings"
+                }
+            },
+            "provenance": {
+                "AospPlatformEvent": {
+                    "source": {
+                        "service_name": "dumpsys",
+                        "event_id": "event-1"
+                    }
+                }
+            }
+        });
+
+        let error = serde_json::from_value::<AndroidObservation>(json)
+            .expect_err("shell-like provenance rejected");
+
+        assert!(error.to_string().contains(AOSP_FOREGROUND_OBSERVER_SERVICE));
     }
 
     #[test]
