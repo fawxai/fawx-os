@@ -23,10 +23,11 @@ This list tracks the remaining gates before we can call the rooted Android proto
 - Android probes can project both `ReconRootedStock` and `AospPlatform` substrate contracts, with AOSP observations explicitly blocked as `AdapterUnavailable` until a real platform adapter exists.
 - AOSP escape analysis exists as a decision rubric so platform probes can answer whether AOSP provides enough fine-grained control or whether Fawx OS should consider another Linux-based mobile foundation.
 - AOSP foreground observation now has a typed platform-event success seam: shell/recon helpers still return `AdapterUnavailable`, and only an auditable `AospForegroundEvent` can produce `AospPlatform` foreground evidence.
+- The Android probe can ingest a privileged AOSP foreground event file, proving the runtime-side event contract while preserving `AdapterUnavailable` as the default AOSP behavior.
 
 ## Remaining
 
 - Local model inference is not connected yet. The current terminal session uses deterministic intent parsing so the runtime contract can be tested before model quality is introduced.
 - If AICore/Gemini Nano exposes a supported API surface, add it as a provider adapter that emits candidates into the existing contract.
-- AOSP/system-image testing is not connected yet. The next AOSP slice should connect a real privileged service event to the `AospForegroundEvent` seam on an AOSP target.
+- AOSP/system-image testing is not connected yet. The next AOSP slice should make a real privileged service produce the `AospForegroundEvent` currently supplied by the probe ingest file.
 - The escape-analysis matrix is initially scored from rooted-stock evidence and contract assumptions. It needs real AOSP/system-service evidence before we make a durable platform commitment.

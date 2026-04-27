@@ -255,6 +255,32 @@ The first AOSP foreground success path is deliberately narrow:
 That means the future system service has one clean integration point, and recon
 code cannot accidentally masquerade as platform evidence.
 
+The terminal probe can now ingest that platform event through an explicit
+`--aosp-foreground-event-file` path. The file is not a shell observation and it
+must not be populated by `dumpsys`; it is the typed handoff point for a future
+privileged AOSP service such as `fawx-system-foreground-observer`. The default
+AOSP probe must continue to emit `AdapterUnavailable` until that service supplies
+an event.
+
+Example event:
+
+```json
+{
+  "package_name": "com.android.settings",
+  "activity_name": "com.android.settings.Settings",
+  "source": {
+    "service_name": "fawx-system-foreground-observer",
+    "event_id": "event-123"
+  }
+}
+```
+
+The source fields are required so the runtime can audit where platform evidence
+came from. A missing source is invalid evidence, not "unknown" evidence. For
+the foreground primitive, `service_name` must be
+`fawx-system-foreground-observer`; shell-like producers such as `dumpsys` are
+rejected by the adapter.
+
 ## Minimum First-Implementation Contract
 
 For the first Android boundary implementation, we need:

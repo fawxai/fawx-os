@@ -73,7 +73,7 @@ rooted/AOSP probes.
 
 | Capability | Minimum acceptable control | Current evidence | Current score | Exit pressure |
 | --- | --- | --- | --- | --- |
-| Foreground observation | Typed app/window focus events without shell parsing | Rooted recon uses `dumpsys`; AOSP returns `AdapterUnavailable` until real adapter exists | 1 | Medium |
+| Foreground observation | Typed app/window focus events without shell parsing | Rooted recon uses `dumpsys`; AOSP has a typed event ingest seam, but no real service producer yet | 1 | Medium |
 | App launch/resume | Typed platform command with result evidence | Rooted recon can launch with `monkey`; AOSP contract says available but not implemented | 1 | Medium |
 | Background execution | Supervised long-running service below UI lifecycle | Rust process can run through adb/recon; AOSP service not implemented | 1 | High |
 | Notification read | Typed notification events with source/app metadata | Capability map says AOSP should own this; no adapter yet | U | High |
@@ -159,8 +159,8 @@ Unacceptable evidence:
 
 The next AOSP-directed experiments should be:
 
-1. Foreground observation system event: replace AOSP `AdapterUnavailable` with a
-   real privileged event source that emits `AospForegroundEvent`.
+1. Foreground observation system event: connect a real privileged service to the
+   `AospForegroundEvent` ingest seam and prove it emits without shell/dumpsys.
 2. App launch/resume platform command: replace shell-style launch with a system
    adapter command and typed execution result.
 3. Background supervisor service: prove a Rust-owned task can continue while the
