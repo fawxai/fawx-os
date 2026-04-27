@@ -74,7 +74,7 @@ rooted/AOSP probes.
 | Capability | Minimum acceptable control | Current evidence | Current score | Exit pressure |
 | --- | --- | --- | --- | --- |
 | Foreground observation | Typed app/window focus events without shell parsing | Rooted recon uses `dumpsys`; AOSP has a typed event ingest seam, but no real service producer yet | 1 | Medium |
-| App launch/resume | Typed platform command with result evidence | Rooted recon can launch with `monkey`; AOSP contract says available but not implemented | 1 | Medium |
+| App launch/resume | Typed platform command with result evidence | AOSP has a typed app-controller result ingest seam, but no real service producer yet | 1 | Medium |
 | Background execution | Supervised long-running service below UI lifecycle | AOSP has a typed supervisor ingest seam, but no real service producer yet | 1 | High |
 | Notification read | Typed notification events with source/app metadata | Capability map says AOSP should own this; no adapter yet | U | High |
 | Notification post | Typed user-visible notification action | Requires AOSP privilege on rooted stock; no adapter yet | U | Medium |

@@ -9,16 +9,18 @@ use fawx_agent_loop::{
     AgentLoop, BackgroundObservation, BackgroundRunner, BackgroundTickRequest, LoopStepRequest,
 };
 use fawx_android_adapter::{
-    AndroidActionRequest, AndroidBackgroundSupervisorUnavailableReason, AndroidCommand,
-    AndroidEvent, AndroidForegroundUnavailableReason, AndroidObservation, AndroidSubstrate,
-    CommandOutput, LocalModelProbeReport, execute_android_action_request, foreground_observation,
-    local_model_probe,
+    AndroidActionRequest, AndroidAppLaunchUnavailableReason,
+    AndroidBackgroundSupervisorUnavailableReason, AndroidCommand, AndroidEvent,
+    AndroidForegroundUnavailableReason, AndroidObservation, AndroidObservationProvenance,
+    AndroidSubstrate, CommandOutput, LocalModelProbeReport, execute_android_action_request,
+    foreground_observation, local_model_probe,
 };
 use fawx_harness::{
-    BackgroundSupervisorUnavailableReason, CandidateAcceptanceDecision, ForegroundPolicyDecision,
-    ForegroundUnavailableReason, IntentCandidate, IntentCandidateAuthority, LocalModelLocality,
-    LocalModelProviderRef, ModelActionKind, ModelActionProposal, ModelActivityKind,
-    ModelActivityProposal, RuntimeEvent, RuntimeObservation, RuntimeObservationSource, TaskState,
+    AppLaunchUnavailableReason, BackgroundSupervisorUnavailableReason, CandidateAcceptanceDecision,
+    ForegroundPolicyDecision, ForegroundUnavailableReason, IntentCandidate,
+    IntentCandidateAuthority, LocalModelLocality, LocalModelProviderRef, ModelActionKind,
+    ModelActionProposal, ModelActivityKind, ModelActivityProposal, RuntimeEvent,
+    RuntimeObservation, RuntimeObservationSource, RuntimePlatformEventSource, TaskState,
     TaskTransitionError, apply_foreground_policy, apply_owner_command_grants_for_intent_candidate,
     begin_current_action_execution, evaluate_intent_candidate_acceptance,
     fail_current_action_execution, record_action_checkpoint, require_foreground_attention,
@@ -1125,6 +1127,7 @@ fn record_runtime_action_failure(
     let observation = RuntimeObservation {
         source: RuntimeObservationSource::Android {
             substrate: format!("{:?}", request.substrate),
+            platform_event_source: None,
         },
         event: RuntimeEvent::RuntimeActionFailed {
             action: android_command_label(&request.command).to_string(),
@@ -1475,9 +1478,17 @@ fn describe_foreground_event(event: &AndroidEvent) -> String {
 }
 
 fn runtime_observation_from_android(observation: &AndroidObservation) -> RuntimeObservation {
+    let platform_event_source = observation.provenance().map(|provenance| match provenance {
+        AndroidObservationProvenance::AospPlatformEvent { source } => RuntimePlatformEventSource {
+            service_name: source.service_name.clone(),
+            event_id: source.event_id.clone(),
+        },
+    });
+
     RuntimeObservation {
         source: RuntimeObservationSource::Android {
             substrate: format!("{:?}", observation.substrate()),
+            platform_event_source,
         },
         event: match observation.event() {
             AndroidEvent::ForegroundAppChanged {
@@ -1525,6 +1536,26 @@ fn runtime_observation_from_android(observation: &AndroidObservation) -> Runtime
                 reason: match reason {
                     AndroidBackgroundSupervisorUnavailableReason::AdapterUnavailable => {
                         BackgroundSupervisorUnavailableReason::AdapterUnavailable
+                    }
+                },
+                raw_source: raw_source.clone(),
+            },
+            AndroidEvent::AppLaunchCompleted {
+                package_name,
+                activity_name,
+            } => RuntimeEvent::AppLaunchCompleted {
+                package_name: package_name.clone(),
+                activity_name: activity_name.clone(),
+            },
+            AndroidEvent::AppLaunchUnavailable {
+                target,
+                reason,
+                raw_source,
+            } => RuntimeEvent::AppLaunchUnavailable {
+                target: target.clone(),
+                reason: match reason {
+                    AndroidAppLaunchUnavailableReason::AdapterUnavailable => {
+                        AppLaunchUnavailableReason::AdapterUnavailable
                     }
                 },
                 raw_source: raw_source.clone(),
@@ -2389,7 +2420,8 @@ mod tests {
         assert_eq!(
             runtime_observation.source,
             RuntimeObservationSource::Android {
-                substrate: "AospPlatform".to_string()
+                substrate: "AospPlatform".to_string(),
+                platform_event_source: None,
             }
         );
         assert!(matches!(
@@ -2398,6 +2430,40 @@ mod tests {
                 reason: ForegroundUnavailableReason::AdapterUnavailable,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn aosp_app_launch_runtime_observation_preserves_platform_event_source() {
+        let android_observation =
+            fawx_android_adapter::aosp_app_launch_observation_from_platform_result(
+                fawx_android_adapter::AospAppLaunchResult {
+                    package_name: "com.android.settings".to_string(),
+                    activity_name: Some("com.android.settings.Settings".to_string()),
+                    source: fawx_android_adapter::AospPlatformEventSource {
+                        service_name: fawx_android_adapter::AOSP_APP_CONTROLLER_SERVICE.to_string(),
+                        event_id: "event-123".to_string(),
+                    },
+                },
+            )
+            .expect("valid app launch result");
+
+        let runtime_observation = runtime_observation_from_android(&android_observation);
+
+        assert_eq!(
+            runtime_observation.source,
+            RuntimeObservationSource::Android {
+                substrate: "AospPlatform".to_string(),
+                platform_event_source: Some(RuntimePlatformEventSource {
+                    service_name: "fawx-system-app-controller".to_string(),
+                    event_id: "event-123".to_string(),
+                }),
+            }
+        );
+        assert!(matches!(
+            runtime_observation.event,
+            RuntimeEvent::AppLaunchCompleted { package_name, .. }
+                if package_name == "com.android.settings"
         ));
     }
 

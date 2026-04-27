@@ -25,10 +25,11 @@ This list tracks the remaining gates before we can call the rooted Android proto
 - AOSP foreground observation now has a typed platform-event success seam: shell/recon helpers still return `AdapterUnavailable`, and only an auditable `AospForegroundEvent` can produce `AospPlatform` foreground evidence.
 - The Android probe can ingest a privileged AOSP foreground event file, proving the runtime-side event contract while preserving `AdapterUnavailable` as the default AOSP behavior.
 - AOSP background execution now has a typed supervisor heartbeat ingest seam: adb/recon process survival still does not count as platform supervision, and only `fawx-system-background-supervisor` provenance can produce an AOSP supervisor heartbeat.
+- AOSP app launch/resume now has a typed app-controller result ingest seam: `monkey` remains rooted-stock recon only, and only `fawx-system-app-controller` provenance can produce an AOSP app-launch success.
 
 ## Remaining
 
 - Local model inference is not connected yet. The current terminal session uses deterministic intent parsing so the runtime contract can be tested before model quality is introduced.
 - If AICore/Gemini Nano exposes a supported API surface, add it as a provider adapter that emits candidates into the existing contract.
-- AOSP/system-image testing is not connected yet. The next AOSP slice should make real privileged services produce the foreground and background-supervisor events currently supplied by probe ingest files.
+- AOSP/system-image testing is not connected yet. The next AOSP slice should make real privileged services produce the foreground, app-controller, and background-supervisor events currently supplied by probe ingest files.
 - The escape-analysis matrix is initially scored from rooted-stock evidence and contract assumptions. It needs real AOSP/system-service evidence before we make a durable platform commitment.
