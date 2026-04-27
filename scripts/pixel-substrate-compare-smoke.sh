@@ -48,6 +48,8 @@ assert_json "$aosp_output" '[.observations[] | select(.name == "aosp-platform-ad
 assert_json "$aosp_output" '[.observations[] | select(.summary == "AOSP platform adapter is not connected in this terminal binary")] | length == 1' "AOSP probe does not fake platform connectivity"
 assert_json "$aosp_output" '[.observations[] | select(.android_observation.event.ForegroundObservationUnavailable.reason == "AdapterUnavailable")] | length == 1' "AOSP foreground observation is explicitly unavailable"
 assert_json "$aosp_output" '[.observations[] | select(.android_observation.event.ForegroundAppChanged != null)] | length == 0' "AOSP probe emits no shell-backed foreground success"
+assert_json "$aosp_output" '[.observations[] | select(.android_observation.event.BackgroundSupervisorUnavailable.reason == "AdapterUnavailable")] | length == 1' "AOSP background supervisor is explicitly unavailable"
+assert_json "$aosp_output" '[.observations[] | select(.android_observation.event.BackgroundSupervisorHeartbeat != null)] | length == 0' "AOSP probe emits no recon-backed supervisor success"
 assert_json "$aosp_output" '[.capability_statuses[] | select(.capability == "PlaceCall" and .status == "Available")] | length == 1' "AOSP probe shows privileged platform capabilities from typed map"
 assert_json "$aosp_output" '[.capability_statuses[] | select(.capability == "RootShell" and .status == "Unavailable")] | length == 1' "AOSP probe marks root shell unavailable as a platform primitive"
 

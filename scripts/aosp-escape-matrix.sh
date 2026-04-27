@@ -18,7 +18,7 @@ Capability                  Score  Exit Pressure  Current Evidence
 --------------------------  -----  -------------  ----------------
 Foreground observation      1      Medium         rooted recon uses dumpsys; AOSP AdapterUnavailable
 App launch/resume           1      Medium         rooted recon uses monkey; AOSP command not implemented
-Background execution        1      High           Rust process runs via adb/recon; no AOSP supervisor
+Background execution        1      High           typed supervisor ingest seam; no real AOSP service producer yet
 Notification read           U      High           no adapter yet
 Notification post           U      Medium         requires AOSP privilege; no adapter yet
 Phone call                  U      High           no telephony adapter yet
@@ -31,7 +31,7 @@ Ephemeral verification UX   1      Medium         terminal approval exists; no O
 Next evidence gates:
 1. Connect AOSP foreground AdapterUnavailable to a real AospForegroundEvent.
 2. Replace shell launch with a platform app launch/resume command.
-3. Prove a background supervisor survives app switching.
+3. Connect a real AOSP service to the background supervisor event seam.
 4. Bridge notifications as typed runtime events.
 
 Decision gate:

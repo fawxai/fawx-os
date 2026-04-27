@@ -42,6 +42,11 @@ pub enum ForegroundUnavailableReason {
     Unsupported,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackgroundSupervisorUnavailableReason {
+    AdapterUnavailable,
+}
+
 /// Device-agnostic observations flowing into the harness policy layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeEvent {
@@ -52,6 +57,15 @@ pub enum RuntimeEvent {
     ForegroundUnavailable {
         target: String,
         reason: ForegroundUnavailableReason,
+        raw_source: Option<String>,
+    },
+    BackgroundSupervisorHeartbeat {
+        supervisor_id: String,
+        active_tasks: u32,
+    },
+    BackgroundSupervisorUnavailable {
+        target: String,
+        reason: BackgroundSupervisorUnavailableReason,
         raw_source: Option<String>,
     },
     NotificationReceived {
