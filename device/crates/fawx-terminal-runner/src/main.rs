@@ -14,11 +14,12 @@ use fawx_android_adapter::{
     execute_android_action_request, foreground_observation, local_model_probe,
 };
 use fawx_harness::{
-    ForegroundPolicyDecision, ForegroundUnavailableReason, ModelActionKind, ModelActionProposal,
-    ModelActivityKind, ModelActivityProposal, RuntimeEvent, RuntimeObservation,
-    RuntimeObservationSource, TaskState, TaskTransitionError, apply_foreground_policy,
-    begin_current_action_execution, fail_current_action_execution, record_action_checkpoint,
-    require_foreground_attention, satisfy_human_handoff,
+    ForegroundPolicyDecision, ForegroundUnavailableReason, IntentCandidate, LocalModelLocality,
+    LocalModelProviderRef, ModelActionKind, ModelActionProposal, ModelActivityKind,
+    ModelActivityProposal, RuntimeEvent, RuntimeObservation, RuntimeObservationSource, TaskState,
+    TaskTransitionError, apply_foreground_policy, begin_current_action_execution,
+    fail_current_action_execution, record_action_checkpoint, require_foreground_attention,
+    satisfy_human_handoff,
 };
 use fawx_kernel::{
     ActionBoundary, ActionBoundaryState, AgentActionStatus, AgentActivityTarget,
@@ -121,6 +122,10 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         "local-model-probe" => {
             run_local_model_probe()?;
         }
+        "candidate-dry-run" => {
+            let prompt = joined_tail(&args, 1, "prompt")?;
+            run_candidate_dry_run(&prompt)?;
+        }
         "session" => {
             run_terminal_session(&store)?;
         }
@@ -174,7 +179,11 @@ struct BackgroundTickOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TerminalSessionCommand {
-    OpenApp { label: String, package_name: String },
+    OpenApp {
+        label: String,
+        package_name: String,
+        candidate: Box<IntentCandidate>,
+    },
     Help,
     List,
     Quit,
@@ -185,6 +194,9 @@ enum TerminalSessionIntentSource {
     /// Direct owner input parsed by the session shell. This may mint scoped
     /// grants for the exact command target because the user is the authority.
     OwnerCommand,
+    /// Candidate produced by a model/provider. This may propose actions, but it
+    /// must not mint grants or impersonate owner authority.
+    ModelCandidate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +204,9 @@ struct TerminalSessionIntent {
     source: TerminalSessionIntentSource,
     command: TerminalSessionCommand,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeterministicSessionInterpreter;
 
 impl BackgroundTickOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
@@ -355,6 +370,7 @@ fn run_terminal_session(store: &TaskStore) -> Result<(), Box<dyn Error>> {
     );
     println!("Try: open settings, open launcher, open package <android.package>, list, help, quit");
 
+    let interpreter = DeterministicSessionInterpreter;
     let mut turn_index = 0_u64;
     loop {
         print!("fawx› ");
@@ -369,19 +385,25 @@ fn run_terminal_session(store: &TaskStore) -> Result<(), Box<dyn Error>> {
             continue;
         }
 
-        match parse_terminal_session_intent(&input) {
+        match interpreter.interpret(&input, turn_index.saturating_add(1)) {
             Ok(TerminalSessionIntent {
                 source,
                 command:
                     TerminalSessionCommand::OpenApp {
                         label,
                         package_name,
+                        candidate,
                     },
             }) => {
                 turn_index += 1;
-                if let Err(error) =
-                    run_session_open_app(store, turn_index, source, &label, &package_name)
-                {
+                if let Err(error) = run_session_open_app(
+                    store,
+                    turn_index,
+                    source,
+                    &label,
+                    &package_name,
+                    *candidate,
+                ) {
                     println!("blocked: {error}");
                 }
             }
@@ -411,32 +433,20 @@ fn run_session_open_app(
     source: TerminalSessionIntentSource,
     label: &str,
     package_name: &str,
+    candidate: IntentCandidate,
 ) -> Result<(), Box<dyn Error>> {
     let task_id = session_task_id(turn_index)?;
     let objective = format!("open {label}");
     store.create(TaskState::new_background_task(&task_id, objective))?;
     grant_session_app_control(store, &task_id, source, package_name)?;
 
+    let (model_activity, model_action) = candidate.into_loop_proposals();
     let accepted = AgentLoop::new(store.clone()).step(LoopStepRequest {
         task_id: task_id.clone(),
         observations: vec![],
         expected_foreground_package: None,
-        model_activity: Some(ModelActivityProposal {
-            kind: ModelActivityKind::Planning,
-            target: Some(AgentActivityTarget::AndroidPackage {
-                package_name: package_name.to_string(),
-            }),
-            description: format!("Opening {label} through the Android runtime adapter."),
-        }),
-        model_action: Some(ModelActionProposal {
-            kind: ModelActionKind::OpenApp,
-            target: Some(AgentActivityTarget::AndroidPackage {
-                package_name: package_name.to_string(),
-            }),
-            reason: format!("open {label}"),
-            expected_observation: Some(format!("{label} is foreground")),
-            proposal_id: None,
-        }),
+        model_activity,
+        model_action,
     })?;
 
     println!(
@@ -501,6 +511,7 @@ fn grant_session_app_control(
             })?;
             Ok(())
         }
+        TerminalSessionIntentSource::ModelCandidate => Ok(()),
     }
 }
 
@@ -568,14 +579,64 @@ fn session_action_is_closed(state: &TaskState) -> bool {
     })
 }
 
-fn parse_terminal_session_intent(input: &str) -> Result<TerminalSessionIntent, String> {
-    Ok(TerminalSessionIntent {
-        source: TerminalSessionIntentSource::OwnerCommand,
-        command: parse_terminal_session_command(input)?,
+impl DeterministicSessionInterpreter {
+    fn interpret(&self, input: &str, turn_index: u64) -> Result<TerminalSessionIntent, String> {
+        Ok(TerminalSessionIntent {
+            source: TerminalSessionIntentSource::OwnerCommand,
+            command: parse_terminal_session_command(input, turn_index)?,
+        })
+    }
+}
+
+fn parse_terminal_session_command(
+    input: &str,
+    turn_index: u64,
+) -> Result<TerminalSessionCommand, String> {
+    parse_terminal_session_command_with_provider(
+        input,
+        turn_index,
+        LocalModelProviderRef {
+            provider_id: "deterministic-session-parser".to_string(),
+            locality: LocalModelLocality::DeterministicFallback,
+        },
+    )
+}
+
+fn parse_terminal_session_command_with_provider(
+    input: &str,
+    turn_index: u64,
+    provider: LocalModelProviderRef,
+) -> Result<TerminalSessionCommand, String> {
+    let trimmed = input.trim();
+    let parsed = parse_terminal_session_command_target(trimmed)?;
+    Ok(match parsed {
+        ParsedTerminalSessionCommand::OpenApp {
+            label,
+            package_name,
+        } => open_app_command_with_candidate(
+            &label,
+            &package_name,
+            prompt_candidate_id(turn_index),
+            provider,
+            trimmed,
+        ),
+        ParsedTerminalSessionCommand::Help => TerminalSessionCommand::Help,
+        ParsedTerminalSessionCommand::List => TerminalSessionCommand::List,
+        ParsedTerminalSessionCommand::Quit => TerminalSessionCommand::Quit,
     })
 }
 
-fn parse_terminal_session_command(input: &str) -> Result<TerminalSessionCommand, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParsedTerminalSessionCommand {
+    OpenApp { label: String, package_name: String },
+    Help,
+    List,
+    Quit,
+}
+
+fn parse_terminal_session_command_target(
+    input: &str,
+) -> Result<ParsedTerminalSessionCommand, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err("empty prompt".to_string());
@@ -583,17 +644,20 @@ fn parse_terminal_session_command(input: &str) -> Result<TerminalSessionCommand,
 
     let normalized = trimmed.to_ascii_lowercase();
     match normalized.as_str() {
-        "quit" | "exit" | ":q" => return Ok(TerminalSessionCommand::Quit),
-        "help" | "?" => return Ok(TerminalSessionCommand::Help),
-        "list" | "tasks" | "status" => return Ok(TerminalSessionCommand::List),
+        "quit" | "exit" | ":q" => return Ok(ParsedTerminalSessionCommand::Quit),
+        "help" | "?" => return Ok(ParsedTerminalSessionCommand::Help),
+        "list" | "tasks" | "status" => return Ok(ParsedTerminalSessionCommand::List),
         "open settings" | "launch settings" => {
-            return Ok(open_app_command("Settings", "com.android.settings"));
+            return Ok(ParsedTerminalSessionCommand::OpenApp {
+                label: "Settings".to_string(),
+                package_name: "com.android.settings".to_string(),
+            });
         }
         "open launcher" | "launch launcher" | "go home" | "home" => {
-            return Ok(open_app_command(
-                "Launcher",
-                "com.google.android.apps.nexuslauncher",
-            ));
+            return Ok(ParsedTerminalSessionCommand::OpenApp {
+                label: "Launcher".to_string(),
+                package_name: "com.google.android.apps.nexuslauncher".to_string(),
+            });
         }
         _ => {}
     }
@@ -606,7 +670,7 @@ fn parse_terminal_session_command(input: &str) -> Result<TerminalSessionCommand,
     ] {
         if normalized.starts_with(prefix) {
             let package_name = &trimmed[prefix.len()..];
-            return parse_open_package(package_name);
+            return parse_open_package_target(package_name);
         }
     }
     for prefix in ["open ", "launch "] {
@@ -614,22 +678,72 @@ fn parse_terminal_session_command(input: &str) -> Result<TerminalSessionCommand,
             && let Some(package_name) = trimmed.get(prefix.len()..)
             && package_name.contains('.')
         {
-            return parse_open_package(package_name);
+            return parse_open_package_target(package_name);
         }
     }
 
     Err(format!("unsupported prompt: {trimmed}"))
 }
 
-fn parse_open_package(package_name: &str) -> Result<TerminalSessionCommand, String> {
-    validate_android_package_target(package_name)?;
-    Ok(open_app_command(package_name, package_name))
+fn prompt_candidate_id(turn_index: u64) -> String {
+    format!("session-turn-{turn_index}")
 }
 
-fn open_app_command(label: &str, package_name: &str) -> TerminalSessionCommand {
+fn parse_open_package_target(package_name: &str) -> Result<ParsedTerminalSessionCommand, String> {
+    validate_android_package_target(package_name)?;
+    Ok(ParsedTerminalSessionCommand::OpenApp {
+        label: package_name.to_string(),
+        package_name: package_name.to_string(),
+    })
+}
+
+fn open_app_command_with_candidate(
+    label: &str,
+    package_name: &str,
+    candidate_id: String,
+    provider: LocalModelProviderRef,
+    prompt: &str,
+) -> TerminalSessionCommand {
     TerminalSessionCommand::OpenApp {
         label: label.to_string(),
         package_name: package_name.to_string(),
+        candidate: Box::new(open_app_intent_candidate(
+            label,
+            package_name,
+            candidate_id,
+            provider,
+            prompt,
+        )),
+    }
+}
+
+fn open_app_intent_candidate(
+    label: &str,
+    package_name: &str,
+    candidate_id: String,
+    provider: LocalModelProviderRef,
+    prompt: &str,
+) -> IntentCandidate {
+    IntentCandidate {
+        candidate_id,
+        provider,
+        prompt: prompt.to_string(),
+        model_activity: Some(ModelActivityProposal {
+            kind: ModelActivityKind::Planning,
+            target: Some(AgentActivityTarget::AndroidPackage {
+                package_name: package_name.to_string(),
+            }),
+            description: format!("Opening {label} through the Android runtime adapter."),
+        }),
+        model_action: Some(ModelActionProposal {
+            kind: ModelActionKind::OpenApp,
+            target: Some(AgentActivityTarget::AndroidPackage {
+                package_name: package_name.to_string(),
+            }),
+            reason: format!("open {label}"),
+            expected_observation: Some(format!("{label} is foreground")),
+            proposal_id: None,
+        }),
     }
 }
 
@@ -708,6 +822,46 @@ fn run_local_model_probe() -> Result<(), Box<dyn Error>> {
 
 fn local_model_probe_json(report: &LocalModelProbeReport) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(report)
+}
+
+fn run_candidate_dry_run(prompt: &str) -> Result<(), Box<dyn Error>> {
+    let intent = model_candidate_intent(prompt, 1)?;
+    println!("{}", candidate_dry_run_json(&intent)?);
+    Ok(())
+}
+
+fn model_candidate_intent(prompt: &str, turn_index: u64) -> Result<TerminalSessionIntent, String> {
+    Ok(TerminalSessionIntent {
+        source: TerminalSessionIntentSource::ModelCandidate,
+        command: parse_terminal_session_command_with_provider(
+            prompt,
+            turn_index,
+            LocalModelProviderRef {
+                provider_id: "dry-run-model-candidate".to_string(),
+                locality: LocalModelLocality::DeviceLocal,
+            },
+        )?,
+    })
+}
+
+fn candidate_dry_run_json(intent: &TerminalSessionIntent) -> Result<String, serde_json::Error> {
+    let candidate = match &intent.command {
+        TerminalSessionCommand::OpenApp { candidate, .. } => serde_json::to_value(candidate)?,
+        TerminalSessionCommand::Help
+        | TerminalSessionCommand::List
+        | TerminalSessionCommand::Quit => serde_json::Value::Null,
+    };
+    serde_json::to_string_pretty(&serde_json::json!({
+        "source": terminal_session_source_label(intent.source),
+        "candidate": candidate,
+    }))
+}
+
+fn terminal_session_source_label(source: TerminalSessionIntentSource) -> &'static str {
+    match source {
+        TerminalSessionIntentSource::OwnerCommand => "OwnerCommand",
+        TerminalSessionIntentSource::ModelCandidate => "ModelCandidate",
+    }
 }
 
 fn execute_action(
@@ -1370,6 +1524,7 @@ fn print_usage() {
     eprintln!("  fawx-terminal-runner begin-action <task-id>");
     eprintln!("  fawx-terminal-runner execute-action <task-id>");
     eprintln!("  fawx-terminal-runner local-model-probe");
+    eprintln!("  fawx-terminal-runner candidate-dry-run <prompt>");
     eprintln!("  fawx-terminal-runner session");
     eprintln!("  fawx-terminal-runner heartbeat <task-id> [count] [interval-ms] [--foreground]");
     eprintln!(
@@ -1709,20 +1864,131 @@ mod tests {
 
     #[test]
     fn terminal_session_parser_supports_open_settings() {
-        let command = parse_terminal_session_command("open settings").expect("parse prompt");
+        let command = parse_terminal_session_command("open settings", 7).expect("parse prompt");
+
+        let TerminalSessionCommand::OpenApp {
+            label,
+            package_name,
+            candidate,
+        } = command
+        else {
+            panic!("expected open app command");
+        };
+        assert_eq!(label, "Settings");
+        assert_eq!(package_name, "com.android.settings");
+        assert_eq!(candidate.candidate_id, "session-turn-7");
+        assert_eq!(
+            candidate.provider.locality,
+            LocalModelLocality::DeterministicFallback
+        );
+        assert_eq!(
+            candidate.provider.provider_id,
+            "deterministic-session-parser"
+        );
+        assert!(matches!(
+            candidate.model_action,
+            Some(ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage { package_name }),
+                ..
+            }) if package_name == "com.android.settings"
+        ));
+    }
+
+    #[test]
+    fn deterministic_session_candidate_preserves_provider_provenance() {
+        let provider = LocalModelProviderRef {
+            provider_id: "pixel-aicore-candidate".to_string(),
+            locality: LocalModelLocality::DeviceLocal,
+        };
+        let command = parse_terminal_session_command_with_provider("open settings", 3, provider)
+            .expect("parse prompt");
+        let TerminalSessionCommand::OpenApp { candidate, .. } = command else {
+            panic!("expected open app command");
+        };
+        let (_activity, action) = candidate.into_loop_proposals();
 
         assert_eq!(
-            command,
-            TerminalSessionCommand::OpenApp {
-                label: "Settings".to_string(),
-                package_name: "com.android.settings".to_string()
-            }
+            action.expect("action").proposal_id.as_deref(),
+            Some("intent-candidate:pixel-aicore-candidate:session-turn-3")
         );
     }
 
     #[test]
+    fn model_candidate_session_source_does_not_mint_owner_grants() {
+        let store = test_store();
+        let candidate = open_app_intent_candidate(
+            "Settings",
+            "com.android.settings",
+            "candidate-1".to_string(),
+            LocalModelProviderRef {
+                provider_id: "pixel-aicore-candidate".to_string(),
+                locality: LocalModelLocality::DeviceLocal,
+            },
+            "open settings",
+        );
+
+        let error = run_session_open_app(
+            &store,
+            1,
+            TerminalSessionIntentSource::ModelCandidate,
+            "Settings",
+            "com.android.settings",
+            candidate,
+        )
+        .expect_err("model candidate should not receive owner grant");
+
+        assert!(error.to_string().contains("missing safety grant"));
+        let task = store
+            .list()
+            .expect("list tasks")
+            .into_iter()
+            .find(|task| task.state.contract.user_intent == "open Settings")
+            .expect("created task");
+        assert!(task.state.contract.safety_grants.is_empty());
+        assert!(task.state.current_action.is_none());
+    }
+
+    #[test]
+    fn candidate_dry_run_uses_model_candidate_source_without_execution() {
+        let intent = model_candidate_intent("open settings", 4).expect("candidate intent");
+        assert_eq!(intent.source, TerminalSessionIntentSource::ModelCandidate);
+
+        let json = candidate_dry_run_json(&intent).expect("dry run json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+
+        assert_eq!(value["source"], "ModelCandidate");
+        assert_eq!(
+            value["candidate"]["provider"]["provider_id"],
+            "dry-run-model-candidate"
+        );
+        assert_eq!(value["candidate"]["candidate_id"], "session-turn-4");
+        assert_eq!(
+            value["candidate"]["model_action"]["kind"],
+            serde_json::json!("OpenApp")
+        );
+    }
+
+    #[test]
+    fn terminal_session_parser_supports_package_targets() {
+        let command =
+            parse_terminal_session_command("open package com.android.settings", 1).expect("parse");
+
+        assert!(matches!(
+            command,
+            TerminalSessionCommand::OpenApp {
+                label,
+                package_name,
+                ..
+            } if label == "com.android.settings" && package_name == "com.android.settings"
+        ));
+    }
+
+    #[test]
     fn terminal_session_intent_marks_owner_command_authority() {
-        let intent = parse_terminal_session_intent("open settings").expect("parse intent");
+        let intent = DeterministicSessionInterpreter
+            .interpret("open settings", 1)
+            .expect("parse intent");
 
         assert_eq!(intent.source, TerminalSessionIntentSource::OwnerCommand);
         assert!(matches!(
@@ -1733,37 +1999,24 @@ mod tests {
     }
 
     #[test]
-    fn terminal_session_parser_supports_package_targets() {
-        let command =
-            parse_terminal_session_command("open package com.android.settings").expect("parse");
-
-        assert_eq!(
-            command,
-            TerminalSessionCommand::OpenApp {
-                label: "com.android.settings".to_string(),
-                package_name: "com.android.settings".to_string()
-            }
-        );
-    }
-
-    #[test]
     fn terminal_session_parser_supports_case_insensitive_verbs() {
-        let command = parse_terminal_session_command("Open Package com.android.settings")
+        let command = parse_terminal_session_command("Open Package com.android.settings", 1)
             .expect("case-insensitive parse");
 
-        assert_eq!(
+        assert!(matches!(
             command,
             TerminalSessionCommand::OpenApp {
-                label: "com.android.settings".to_string(),
-                package_name: "com.android.settings".to_string()
-            }
-        );
+                label,
+                package_name,
+                ..
+            } if label == "com.android.settings" && package_name == "com.android.settings"
+        ));
     }
 
     #[test]
     fn terminal_session_parser_rejects_unsupported_prompts() {
         let error =
-            parse_terminal_session_command("send a message").expect_err("unsupported prompt");
+            parse_terminal_session_command("send a message", 1).expect_err("unsupported prompt");
 
         assert!(error.contains("unsupported prompt"));
     }
