@@ -5,6 +5,7 @@
 //! time without rewriting the kernel or harness.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::process::Command;
 
 /// Which Android-facing substrate produced an observation or accepts a command.
@@ -288,6 +289,44 @@ pub struct CommandOutput {
     pub success: bool,
 }
 
+/// The device-local model surfaces Fawx OS knows how to reason about.
+///
+/// These are provider probes, not execution permissions. A present provider may
+/// still be unusable from this process if Android exposes it only through a
+/// framework SDK, Play services binding, or app-private surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalModelProviderKind {
+    AicoreGeminiNano,
+    GeminiApp,
+    UnknownGoogleAiSurface,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalModelProviderStatus {
+    /// A known package exists, but this terminal-only prototype has not proven
+    /// a stable public inference API.
+    PresentButNoPublicTerminalApi,
+    /// A known package was not found on the current Android image.
+    Unavailable,
+    /// The package-manager probe failed, so provider availability is unknown.
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalModelProviderProbe {
+    pub kind: LocalModelProviderKind,
+    pub status: LocalModelProviderStatus,
+    pub package_name: Option<String>,
+    pub evidence: Vec<String>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalModelProbeReport {
+    pub substrate: AndroidSubstrate,
+    pub providers: Vec<LocalModelProviderProbe>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AndroidReconCommand {
     Whoami,
@@ -313,6 +352,145 @@ pub fn run_recon_command(command: AndroidReconCommand) -> Result<String, String>
         Ok(output.stdout.trim().to_string())
     } else {
         Err(output.failure_summary())
+    }
+}
+
+pub fn local_model_probe(substrate: AndroidSubstrate) -> LocalModelProbeReport {
+    local_model_probe_from_package_result(substrate, installed_package_names())
+}
+
+fn local_model_probe_from_package_result(
+    substrate: AndroidSubstrate,
+    packages: Result<BTreeSet<String>, String>,
+) -> LocalModelProbeReport {
+    let packages = match packages {
+        Ok(packages) => packages,
+        Err(error) => {
+            return LocalModelProbeReport {
+                substrate,
+                providers: indeterminate_local_model_probes(error),
+            };
+        }
+    };
+
+    LocalModelProbeReport {
+        substrate,
+        providers: vec![
+            probe_known_local_model_package(
+                LocalModelProviderKind::AicoreGeminiNano,
+                &packages,
+                &["com.google.android.aicore"],
+                "AICore/Gemini Nano is the preferred local-model surface if Android exposes a stable API.",
+            ),
+            probe_known_local_model_package(
+                LocalModelProviderKind::GeminiApp,
+                &packages,
+                &[
+                    "com.google.android.apps.bard",
+                    "com.google.android.apps.gemini",
+                    "com.google.android.googlequicksearchbox",
+                ],
+                "The Gemini app/Search package may be present, but app-private surfaces are not a Fawx OS control-plane contract.",
+            ),
+            probe_google_ai_package_family(&packages),
+        ],
+    }
+}
+
+fn indeterminate_local_model_probes(error: String) -> Vec<LocalModelProviderProbe> {
+    [
+        (
+            LocalModelProviderKind::AicoreGeminiNano,
+            "Could not inspect package manager state; AICore/Gemini Nano availability is unknown.",
+        ),
+        (
+            LocalModelProviderKind::GeminiApp,
+            "Could not inspect package manager state; Gemini app availability is unknown.",
+        ),
+        (
+            LocalModelProviderKind::UnknownGoogleAiSurface,
+            "Could not inspect package manager state; Google AI package-family availability is unknown.",
+        ),
+    ]
+    .into_iter()
+    .map(|(kind, note)| LocalModelProviderProbe {
+        kind,
+        status: LocalModelProviderStatus::Indeterminate,
+        package_name: None,
+        evidence: vec![format!("pm list packages failed: {error}")],
+        note: note.to_string(),
+    })
+    .collect()
+}
+
+fn installed_package_names() -> Result<BTreeSet<String>, String> {
+    let output = run_command_output(&["pm", "list", "packages"])?;
+    if !output.success {
+        return Err(output.failure_summary());
+    }
+    Ok(parse_pm_list_packages(&output.stdout))
+}
+
+fn parse_pm_list_packages(output: &str) -> BTreeSet<String> {
+    output
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("package:"))
+        .map(str::trim)
+        .filter(|package| !package.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn probe_known_local_model_package(
+    kind: LocalModelProviderKind,
+    packages: &BTreeSet<String>,
+    known_packages: &[&str],
+    note: &str,
+) -> LocalModelProviderProbe {
+    match known_packages
+        .iter()
+        .find(|package| packages.contains(**package))
+    {
+        Some(package) => LocalModelProviderProbe {
+            kind,
+            status: LocalModelProviderStatus::PresentButNoPublicTerminalApi,
+            package_name: Some((*package).to_string()),
+            evidence: vec![format!("installed package: {package}")],
+            note: note.to_string(),
+        },
+        None => LocalModelProviderProbe {
+            kind,
+            status: LocalModelProviderStatus::Unavailable,
+            package_name: None,
+            evidence: Vec::new(),
+            note: note.to_string(),
+        },
+    }
+}
+
+fn probe_google_ai_package_family(packages: &BTreeSet<String>) -> LocalModelProviderProbe {
+    let evidence = packages
+        .iter()
+        .filter(|package| {
+            let lower = package.to_ascii_lowercase();
+            lower.contains("google")
+                && (lower.contains("ai") || lower.contains("gemini") || lower.contains("aicore"))
+        })
+        .take(12)
+        .map(|package| format!("installed package: {package}"))
+        .collect::<Vec<_>>();
+    let status = if evidence.is_empty() {
+        LocalModelProviderStatus::Unavailable
+    } else {
+        LocalModelProviderStatus::PresentButNoPublicTerminalApi
+    };
+
+    LocalModelProviderProbe {
+        kind: LocalModelProviderKind::UnknownGoogleAiSurface,
+        status,
+        package_name: None,
+        evidence,
+        note: "Informational package-family probe. It must not be used as an inference API without a typed adapter contract.".to_string(),
     }
 }
 
@@ -681,6 +859,92 @@ mod tests {
                 | AndroidCapability::SystemSettings
                 | AndroidCapability::RootShell => {}
             }
+        }
+    }
+
+    #[test]
+    fn parses_installed_package_names_from_pm_output() {
+        let packages = parse_pm_list_packages(
+            "package:com.android.settings\npackage: com.google.android.aicore \nignored\n",
+        );
+
+        assert!(packages.contains("com.android.settings"));
+        assert!(packages.contains("com.google.android.aicore"));
+        assert_eq!(packages.len(), 2);
+    }
+
+    #[test]
+    fn local_model_probe_reports_aicore_without_claiming_inference_api() {
+        let packages = BTreeSet::from(["com.google.android.aicore".to_string()]);
+        let probe = probe_known_local_model_package(
+            LocalModelProviderKind::AicoreGeminiNano,
+            &packages,
+            &["com.google.android.aicore"],
+            "test note",
+        );
+
+        assert_eq!(probe.kind, LocalModelProviderKind::AicoreGeminiNano);
+        assert_eq!(
+            probe.status,
+            LocalModelProviderStatus::PresentButNoPublicTerminalApi
+        );
+        assert_eq!(
+            probe.package_name.as_deref(),
+            Some("com.google.android.aicore")
+        );
+        assert!(probe.evidence[0].contains("installed package"));
+    }
+
+    #[test]
+    fn local_model_probe_reports_unavailable_when_known_package_missing() {
+        let packages = BTreeSet::from(["com.android.settings".to_string()]);
+        let probe = probe_known_local_model_package(
+            LocalModelProviderKind::AicoreGeminiNano,
+            &packages,
+            &["com.google.android.aicore"],
+            "test note",
+        );
+
+        assert_eq!(probe.status, LocalModelProviderStatus::Unavailable);
+        assert!(probe.package_name.is_none());
+        assert!(probe.evidence.is_empty());
+    }
+
+    #[test]
+    fn local_model_probe_collects_unknown_google_ai_surfaces_as_informational() {
+        let packages = BTreeSet::from([
+            "com.android.settings".to_string(),
+            "com.google.android.apps.gemini".to_string(),
+            "com.google.android.aicore".to_string(),
+        ]);
+        let probe = probe_google_ai_package_family(&packages);
+
+        assert_eq!(probe.kind, LocalModelProviderKind::UnknownGoogleAiSurface);
+        assert_eq!(
+            probe.status,
+            LocalModelProviderStatus::PresentButNoPublicTerminalApi
+        );
+        assert!(probe.package_name.is_none());
+        assert_eq!(probe.evidence.len(), 2);
+        assert!(probe.note.contains("must not be used as an inference API"));
+    }
+
+    #[test]
+    fn local_model_probe_reports_indeterminate_when_package_manager_fails() {
+        let report = local_model_probe_from_package_result(
+            AndroidSubstrate::ReconRootedStock,
+            Err("cmd package denied".to_string()),
+        );
+
+        assert_eq!(report.substrate, AndroidSubstrate::ReconRootedStock);
+        assert_eq!(report.providers.len(), 3);
+        for provider in report.providers {
+            assert_eq!(provider.status, LocalModelProviderStatus::Indeterminate);
+            assert!(provider.package_name.is_none());
+            assert_eq!(
+                provider.evidence,
+                vec!["pm list packages failed: cmd package denied".to_string()]
+            );
         }
     }
 

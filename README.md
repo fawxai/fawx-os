@@ -64,6 +64,7 @@ Start here:
 - [/Users/joseph/fawx-os/docs/specs/background-task-lifecycle.md](/Users/joseph/fawx-os/docs/specs/background-task-lifecycle.md)
 - [/Users/joseph/fawx-os/docs/specs/pixel-terminal-recon.md](/Users/joseph/fawx-os/docs/specs/pixel-terminal-recon.md)
 - [/Users/joseph/fawx-os/docs/specs/terminal-agent-session.md](/Users/joseph/fawx-os/docs/specs/terminal-agent-session.md)
+- [/Users/joseph/fawx-os/docs/specs/local-model-provider.md](/Users/joseph/fawx-os/docs/specs/local-model-provider.md)
 
 ## Current Status
 
@@ -76,6 +77,10 @@ from typed foreground evidence.
 The interactive terminal session is deterministic for now. It does not call a
 local model yet; it exercises the same typed contracts that a local model will
 eventually feed.
+
+The local model provider contract now exists as a safe boundary: provider probes
+can discover likely on-device model surfaces, but model output is only an
+intent candidate below policy, execution, and observation.
 
 The next step is to grow that slice into:
 
