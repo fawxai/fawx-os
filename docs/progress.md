@@ -33,6 +33,7 @@ This list tracks the remaining gates before we can call the rooted Android proto
 - The Pixel real-task harness proves notification reads do not close from terminal-minted notification evidence; closure still requires a real listener-provenanced `NotificationReceived` event.
 - The first real AOSP prototype plan is written: foreground observation is the first platform primitive, and AOSP must prove it with `fawx-system-foreground-observer` rather than shell or `dumpsys`.
 - AOSP workspace preflight scripts exist and keep AOSP source/build artifacts outside this repository.
+- The substrate decision sprint now provides a no-capital gate before AOSP checkout/build investment. It runs the rooted Pixel substrate smoke, real-task harness, AOSP-unavailable assertions, and local model probe, then emits a JSON recommendation over the must-have agent-phone primitives.
 
 ## Remaining
 

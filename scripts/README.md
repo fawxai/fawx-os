@@ -29,6 +29,11 @@ model-candidate path on a connected Pixel by piping `suggest open settings`,
 platform observations as unavailable until a real privileged adapter exists; it
 is a boundary test, not a fake AOSP implementation.
 
+`./scripts/pixel-substrate-decision-sprint.sh` is the capital-free gate before
+buying storage, renting cloud compute, or starting a full AOSP checkout. It runs
+the substrate comparison smoke, the real-task harness, and probe collection,
+then emits a JSON recommendation over the must-have agent-phone primitives.
+
 `./scripts/aosp-workspace-preflight.sh` checks whether the local machine and
 attached Pixel are ready for a real AOSP checkout/flash attempt. It does not
 download source or mutate the device. AOSP source and build artifacts must live
