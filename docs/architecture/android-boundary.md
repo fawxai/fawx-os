@@ -11,6 +11,12 @@ Its job is to prevent two failure modes:
 
 The solution is an explicit contract.
 
+This boundary should be interpreted alongside
+`docs/architecture/aosp-escape-analysis.md`. The Android adapter is not only a
+build plan; it is also an evidence-gathering surface for deciding whether AOSP
+is sufficient or whether Fawx OS needs a more controllable Linux-based
+foundation.
+
 ## Substrate Strategy
 
 Fawx OS has two Android-facing tracks.
@@ -234,6 +240,9 @@ explicit `AdapterUnavailable` result. This keeps the comparison honest:
 - rooted stock tells us what can be proven through recon today
 - AOSP platform tells us what the eventual system adapter must own
 - the delta between them tells us whether moving into AOSP is justified
+
+When a probe changes one of these facts, update the escape-analysis matrix so
+the project can see whether AOSP is opening doors or merely moving the walls.
 
 ## Minimum First-Implementation Contract
 
