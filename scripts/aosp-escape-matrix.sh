@@ -29,7 +29,7 @@ UI automation/computer use  U      High           no background-capable control 
 Ephemeral verification UX   1      Medium         terminal approval exists; no OS-native surface
 
 Next evidence gates:
-1. Replace AOSP foreground AdapterUnavailable with a real platform event.
+1. Connect AOSP foreground AdapterUnavailable to a real AospForegroundEvent.
 2. Replace shell launch with a platform app launch/resume command.
 3. Prove a background supervisor survives app switching.
 4. Bridge notifications as typed runtime events.

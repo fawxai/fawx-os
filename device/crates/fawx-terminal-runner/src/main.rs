@@ -708,7 +708,7 @@ fn expected_session_foreground_package(state: &TaskState) -> Option<String> {
 }
 
 fn foreground_package_from_android_observation(observation: &AndroidObservation) -> Option<&str> {
-    match &observation.event {
+    match observation.event() {
         AndroidEvent::ForegroundAppChanged { package_name, .. } => Some(package_name),
         _ => None,
     }
@@ -1365,7 +1365,7 @@ fn run_foreground_watch(
 ) -> Result<(), Box<dyn Error>> {
     for tick in 1..=count {
         let android_observation = foreground_observation(AndroidSubstrate::ReconRootedStock);
-        let foreground = describe_foreground_event(&android_observation.event);
+        let foreground = describe_foreground_event(android_observation.event());
         let observation = runtime_observation_from_android(&android_observation);
         let mut decision = None;
         let stored = store.transition_state(task_id, |state| {
@@ -1444,7 +1444,7 @@ fn run_heartbeat(
 }
 
 fn describe_foreground() -> String {
-    describe_foreground_event(&foreground_observation(AndroidSubstrate::ReconRootedStock).event)
+    describe_foreground_event(foreground_observation(AndroidSubstrate::ReconRootedStock).event())
 }
 
 fn describe_foreground_event(event: &AndroidEvent) -> String {
@@ -1476,9 +1476,9 @@ fn describe_foreground_event(event: &AndroidEvent) -> String {
 fn runtime_observation_from_android(observation: &AndroidObservation) -> RuntimeObservation {
     RuntimeObservation {
         source: RuntimeObservationSource::Android {
-            substrate: format!("{:?}", observation.substrate),
+            substrate: format!("{:?}", observation.substrate()),
         },
-        event: match &observation.event {
+        event: match observation.event() {
             AndroidEvent::ForegroundAppChanged {
                 package_name,
                 activity_name,
@@ -1762,13 +1762,10 @@ mod tests {
     }
 
     fn foreground(package_name: &str) -> AndroidObservation {
-        AndroidObservation {
-            substrate: AndroidSubstrate::ReconRootedStock,
-            event: AndroidEvent::ForegroundAppChanged {
-                package_name: package_name.to_string(),
-                activity_name: Some(".ExampleActivity".to_string()),
-            },
-        }
+        AndroidObservation::recon_rooted_stock(AndroidEvent::ForegroundAppChanged {
+            package_name: package_name.to_string(),
+            activity_name: Some(".ExampleActivity".to_string()),
+        })
     }
 
     fn create_open_app_action(
