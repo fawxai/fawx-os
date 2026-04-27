@@ -272,6 +272,15 @@ pub enum AndroidEvent {
         reason: AndroidBackgroundSupervisorUnavailableReason,
         raw_source: Option<String>,
     },
+    AppLaunchCompleted {
+        package_name: String,
+        activity_name: Option<String>,
+    },
+    AppLaunchUnavailable {
+        target: String,
+        reason: AndroidAppLaunchUnavailableReason,
+        raw_source: Option<String>,
+    },
     TargetSurfaceBecameUnavailable {
         target: String,
     },
@@ -301,6 +310,11 @@ pub enum AndroidForegroundUnavailableReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AndroidBackgroundSupervisorUnavailableReason {
+    AdapterUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AndroidAppLaunchUnavailableReason {
     AdapterUnavailable,
 }
 
@@ -392,8 +406,20 @@ impl<'de> Deserialize<'de> for AndroidObservation {
                     validate_aosp_platform_event_source(source, AOSP_BACKGROUND_SUPERVISOR_SERVICE)
                         .map_err(serde::de::Error::custom)?;
                 }
+                AndroidEvent::AppLaunchCompleted { .. } => {
+                    let Some(AndroidObservationProvenance::AospPlatformEvent { source }) =
+                        wire.provenance.as_ref()
+                    else {
+                        return Err(serde::de::Error::custom(
+                            "AospPlatform app launch observations require AospPlatformEvent provenance",
+                        ));
+                    };
+                    validate_aosp_platform_event_source(source, AOSP_APP_CONTROLLER_SERVICE)
+                        .map_err(serde::de::Error::custom)?;
+                }
                 AndroidEvent::ForegroundObservationUnavailable { .. }
                 | AndroidEvent::BackgroundSupervisorUnavailable { .. }
+                | AndroidEvent::AppLaunchUnavailable { .. }
                     if matches!(
                         wire.provenance,
                         Some(AndroidObservationProvenance::AospPlatformEvent { .. })
@@ -433,6 +459,7 @@ pub struct AospPlatformEventSource {
 
 pub const AOSP_FOREGROUND_OBSERVER_SERVICE: &str = "fawx-system-foreground-observer";
 pub const AOSP_BACKGROUND_SUPERVISOR_SERVICE: &str = "fawx-system-background-supervisor";
+pub const AOSP_APP_CONTROLLER_SERVICE: &str = "fawx-system-app-controller";
 
 /// Foreground state emitted by a real AOSP/system adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,6 +474,14 @@ pub struct AospForegroundEvent {
 pub struct AospBackgroundSupervisorEvent {
     pub supervisor_id: String,
     pub active_tasks: u32,
+    pub source: AospPlatformEventSource,
+}
+
+/// App launch/resume result emitted by a real AOSP/system app controller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AospAppLaunchResult {
+    pub package_name: String,
+    pub activity_name: Option<String>,
     pub source: AospPlatformEventSource,
 }
 
@@ -796,6 +831,21 @@ pub fn aosp_background_supervisor_unavailable_observation(target: &str) -> Andro
     }
 }
 
+pub fn aosp_app_launch_unavailable_observation(target: &str) -> AndroidObservation {
+    AndroidObservation {
+        substrate: AndroidSubstrate::AospPlatform,
+        event: AndroidEvent::AppLaunchUnavailable {
+            target: target.to_string(),
+            reason: AndroidAppLaunchUnavailableReason::AdapterUnavailable,
+            raw_source: Some(
+                "AOSP app controller is not connected; monkey/recon app launches must stay on ReconRootedStock"
+                    .to_string(),
+            ),
+        },
+        provenance: None,
+    }
+}
+
 pub fn aosp_foreground_observation_from_platform_event(
     event: AospForegroundEvent,
 ) -> Result<AndroidObservation, String> {
@@ -859,6 +909,40 @@ fn validate_aosp_background_supervisor_event(
     validate_nonempty_token("AOSP background supervisor id", &event.supervisor_id)?;
     validate_no_surrounding_whitespace("AOSP background supervisor id", &event.supervisor_id)?;
     validate_aosp_platform_event_source(&event.source, AOSP_BACKGROUND_SUPERVISOR_SERVICE)?;
+    Ok(())
+}
+
+pub fn aosp_app_launch_observation_from_platform_result(
+    result: AospAppLaunchResult,
+) -> Result<AndroidObservation, String> {
+    validate_aosp_app_launch_result(&result)?;
+    let source = result.source.clone();
+    Ok(AndroidObservation {
+        substrate: AndroidSubstrate::AospPlatform,
+        event: AndroidEvent::AppLaunchCompleted {
+            package_name: result.package_name,
+            activity_name: result.activity_name,
+        },
+        provenance: Some(AndroidObservationProvenance::AospPlatformEvent { source }),
+    })
+}
+
+pub fn aosp_app_launch_observation_from_platform_result_json(
+    result_json: &str,
+) -> Result<AndroidObservation, String> {
+    let result = serde_json::from_str::<AospAppLaunchResult>(result_json)
+        .map_err(|error| format!("failed to decode AOSP app launch result: {error}"))?;
+    aosp_app_launch_observation_from_platform_result(result)
+}
+
+fn validate_aosp_app_launch_result(result: &AospAppLaunchResult) -> Result<(), String> {
+    validate_nonempty_token("AOSP app launch package", &result.package_name)?;
+    validate_no_surrounding_whitespace("AOSP app launch package", &result.package_name)?;
+    if let Some(activity_name) = &result.activity_name {
+        validate_nonempty_token("AOSP app launch activity", activity_name)?;
+        validate_no_surrounding_whitespace("AOSP app launch activity", activity_name)?;
+    }
+    validate_aosp_platform_event_source(&result.source, AOSP_APP_CONTROLLER_SERVICE)?;
     Ok(())
 }
 
@@ -1835,6 +1919,83 @@ mod tests {
     }
 
     #[test]
+    fn aosp_app_launch_result_converts_with_provenance() {
+        let observation = aosp_app_launch_observation_from_platform_result(AospAppLaunchResult {
+            package_name: "com.android.settings".to_string(),
+            activity_name: Some("com.android.settings.Settings".to_string()),
+            source: AospPlatformEventSource {
+                service_name: AOSP_APP_CONTROLLER_SERVICE.to_string(),
+                event_id: "event-1".to_string(),
+            },
+        })
+        .expect("app launch result should convert");
+
+        assert_eq!(observation.substrate, AndroidSubstrate::AospPlatform);
+        assert_eq!(
+            observation.event,
+            AndroidEvent::AppLaunchCompleted {
+                package_name: "com.android.settings".to_string(),
+                activity_name: Some("com.android.settings.Settings".to_string()),
+            }
+        );
+        assert_eq!(
+            observation.provenance,
+            Some(AndroidObservationProvenance::AospPlatformEvent {
+                source: AospPlatformEventSource {
+                    service_name: AOSP_APP_CONTROLLER_SERVICE.to_string(),
+                    event_id: "event-1".to_string(),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn aosp_app_launch_result_rejects_recon_sources() {
+        let error = aosp_app_launch_observation_from_platform_result(AospAppLaunchResult {
+            package_name: "com.android.settings".to_string(),
+            activity_name: None,
+            source: AospPlatformEventSource {
+                service_name: "monkey".to_string(),
+                event_id: "event-1".to_string(),
+            },
+        })
+        .expect_err("monkey source should reject");
+
+        assert!(error.contains(AOSP_APP_CONTROLLER_SERVICE));
+    }
+
+    #[test]
+    fn aosp_app_launch_result_json_decodes_to_platform_observation() {
+        let observation = aosp_app_launch_observation_from_platform_result_json(
+            r#"{
+                "package_name": "com.android.settings",
+                "activity_name": "com.android.settings.Settings",
+                "source": {
+                    "service_name": "fawx-system-app-controller",
+                    "event_id": "event-123"
+                }
+            }"#,
+        )
+        .expect("valid app launch result json should produce observation");
+
+        assert_eq!(observation.substrate, AndroidSubstrate::AospPlatform);
+        assert!(matches!(
+            observation.event,
+            AndroidEvent::AppLaunchCompleted {
+                package_name,
+                activity_name: Some(activity_name),
+            } if package_name == "com.android.settings"
+                && activity_name == "com.android.settings.Settings"
+        ));
+        assert!(matches!(
+            observation.provenance,
+            Some(AndroidObservationProvenance::AospPlatformEvent { source })
+                if source.service_name == AOSP_APP_CONTROLLER_SERVICE
+                    && source.event_id == "event-123"
+        ));
+    }
+
+    #[test]
     fn android_observation_deserialization_rejects_forged_aosp_foreground_success() {
         let json = serde_json::json!({
             "substrate": "AospPlatform",
@@ -1958,6 +2119,54 @@ mod tests {
         assert!(matches!(
             observation.event,
             AndroidEvent::BackgroundSupervisorHeartbeat { .. }
+        ));
+    }
+
+    #[test]
+    fn android_observation_deserialization_requires_app_launch_provenance() {
+        let json = serde_json::json!({
+            "substrate": "AospPlatform",
+            "event": {
+                "AppLaunchCompleted": {
+                    "package_name": "com.android.settings",
+                    "activity_name": ".Settings"
+                }
+            }
+        });
+
+        let error =
+            serde_json::from_value::<AndroidObservation>(json).expect_err("forged AOSP rejected");
+
+        assert!(error.to_string().contains("provenance"));
+    }
+
+    #[test]
+    fn android_observation_deserialization_allows_app_launch_with_provenance() {
+        let json = serde_json::json!({
+            "substrate": "AospPlatform",
+            "event": {
+                "AppLaunchCompleted": {
+                    "package_name": "com.android.settings",
+                    "activity_name": ".Settings"
+                }
+            },
+            "provenance": {
+                "AospPlatformEvent": {
+                    "source": {
+                        "service_name": AOSP_APP_CONTROLLER_SERVICE,
+                        "event_id": "event-1"
+                    }
+                }
+            }
+        });
+
+        let observation =
+            serde_json::from_value::<AndroidObservation>(json).expect("provenance is valid");
+
+        assert_eq!(observation.substrate, AndroidSubstrate::AospPlatform);
+        assert!(matches!(
+            observation.event,
+            AndroidEvent::AppLaunchCompleted { .. }
         ));
     }
 

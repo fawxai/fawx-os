@@ -258,9 +258,11 @@ code cannot accidentally masquerade as platform evidence.
 The terminal probe can now ingest that platform event through an explicit
 `--aosp-foreground-event-file` path. The file is not a shell observation and it
 must not be populated by `dumpsys`; it is the typed handoff point for a future
-privileged AOSP service such as `fawx-system-foreground-observer`. The default
-AOSP probe must continue to emit `AdapterUnavailable` until that service supplies
-an event.
+privileged AOSP service such as `fawx-system-foreground-observer`. These file
+ingest paths are contract fixtures for testing the adapter boundary; they are
+not live AOSP proof and must not raise the escape-analysis score until a real
+privileged service produces the same payload. The default AOSP probe must
+continue to emit `AdapterUnavailable` until that service supplies an event.
 
 Example event:
 
@@ -300,6 +302,26 @@ Until a privileged AOSP service emits that event, the probe must report
 `BackgroundSupervisorUnavailable(AdapterUnavailable)`. This keeps background
 execution score 1 in the escape rubric: the ingest seam exists, but the
 substrate has not yet proven platform-owned supervision.
+
+App launch/resume follows the same rule. Rooted stock may use `monkey` as recon
+to learn the device boundary, but AOSP launch success must come from a typed
+app-controller result emitted by `fawx-system-app-controller`:
+
+```json
+{
+  "package_name": "com.android.settings",
+  "activity_name": "com.android.settings.Settings",
+  "source": {
+    "service_name": "fawx-system-app-controller",
+    "event_id": "event-123"
+  }
+}
+```
+
+Until a privileged AOSP app controller emits that result, the probe must report
+`AppLaunchUnavailable(AdapterUnavailable)`. This result is action evidence only;
+foreground verification remains a separate foreground observation so the runtime
+can independently prove that the requested surface actually settled.
 
 ## Minimum First-Implementation Contract
 

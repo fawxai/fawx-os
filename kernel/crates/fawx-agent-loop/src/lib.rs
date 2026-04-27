@@ -598,6 +598,7 @@ mod tests {
         RuntimeObservation {
             source: RuntimeObservationSource::Android {
                 substrate: "ReconRootedStock".to_string(),
+                platform_event_source: None,
             },
             event: RuntimeEvent::ForegroundAppChanged {
                 package_name: package_name.to_string(),

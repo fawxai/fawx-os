@@ -26,10 +26,26 @@ pub enum ExecutionMode {
 /// Device-agnostic provenance for runtime observations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeObservationSource {
-    Android { substrate: String },
-    Browser { surface: String },
-    Cloud { provider: String },
-    Shell { name: String },
+    Android {
+        substrate: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        platform_event_source: Option<RuntimePlatformEventSource>,
+    },
+    Browser {
+        surface: String,
+    },
+    Cloud {
+        provider: String,
+    },
+    Shell {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePlatformEventSource {
+    pub service_name: String,
+    pub event_id: String,
 }
 
 /// Why a runtime observation could not produce the expected foreground state.
@@ -44,6 +60,11 @@ pub enum ForegroundUnavailableReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackgroundSupervisorUnavailableReason {
+    AdapterUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AppLaunchUnavailableReason {
     AdapterUnavailable,
 }
 
@@ -66,6 +87,15 @@ pub enum RuntimeEvent {
     BackgroundSupervisorUnavailable {
         target: String,
         reason: BackgroundSupervisorUnavailableReason,
+        raw_source: Option<String>,
+    },
+    AppLaunchCompleted {
+        package_name: String,
+        activity_name: Option<String>,
+    },
+    AppLaunchUnavailable {
+        target: String,
+        reason: AppLaunchUnavailableReason,
         raw_source: Option<String>,
     },
     NotificationReceived {
@@ -1731,6 +1761,7 @@ mod tests {
         RuntimeObservation {
             source: RuntimeObservationSource::Android {
                 substrate: "ReconRootedStock".to_string(),
+                platform_event_source: None,
             },
             event: RuntimeEvent::ForegroundAppChanged {
                 package_name: package_name.to_string(),
@@ -2514,6 +2545,7 @@ mod tests {
         let observation = RuntimeObservation {
             source: RuntimeObservationSource::Android {
                 substrate: "ReconRootedStock".to_string(),
+                platform_event_source: None,
             },
             event: RuntimeEvent::RuntimeActionFailed {
                 action: "resume-app-surface".to_string(),
@@ -3329,6 +3361,7 @@ mod tests {
         let observation = RuntimeObservation {
             source: RuntimeObservationSource::Android {
                 substrate: "ReconRootedStock".to_string(),
+                platform_event_source: None,
             },
             event: RuntimeEvent::NetworkAvailabilityChanged { available: false },
         };
@@ -3370,6 +3403,7 @@ mod tests {
         let observation = RuntimeObservation {
             source: RuntimeObservationSource::Android {
                 substrate: "ReconRootedStock".to_string(),
+                platform_event_source: None,
             },
             event: RuntimeEvent::NetworkAvailabilityChanged { available: false },
         };
@@ -3401,6 +3435,7 @@ mod tests {
         let observation = RuntimeObservation {
             source: RuntimeObservationSource::Android {
                 substrate: "ReconRootedStock".to_string(),
+                platform_event_source: None,
             },
             event: RuntimeEvent::NetworkAvailabilityChanged { available: true },
         };
@@ -3437,6 +3472,7 @@ mod tests {
         let observation = RuntimeObservation {
             source: RuntimeObservationSource::Android {
                 substrate: "ReconRootedStock".to_string(),
+                platform_event_source: None,
             },
             event: RuntimeEvent::NetworkAvailabilityChanged { available: true },
         };
@@ -3459,6 +3495,7 @@ mod tests {
         let observation = RuntimeObservation {
             source: RuntimeObservationSource::Android {
                 substrate: "ReconRootedStock".to_string(),
+                platform_event_source: None,
             },
             event: RuntimeEvent::NetworkAvailabilityChanged { available: true },
         };

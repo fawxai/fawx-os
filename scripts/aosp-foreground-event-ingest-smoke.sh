@@ -14,6 +14,9 @@ tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 event_file="$tmp_dir/aosp-foreground-event.json"
 
+# This is a contract fixture, not live platform proof. It verifies that the
+# runtime side accepts only the typed foreground event shape; the escape rubric
+# stays at score 1 until a real privileged AOSP service emits it.
 cat >"$event_file" <<'JSON'
 {
   "package_name": "com.android.settings",

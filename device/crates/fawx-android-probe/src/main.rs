@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use fawx_android_adapter::{
     AndroidCapabilityStatusEntry, AndroidEvent, AndroidObservation, AndroidReconCommand,
     AndroidSubstrate, android_capability_statuses,
+    aosp_app_launch_observation_from_platform_result_json, aosp_app_launch_unavailable_observation,
     aosp_background_supervisor_observation_from_platform_event_json,
     aosp_background_supervisor_unavailable_observation,
     aosp_foreground_observation_from_platform_event_json,
@@ -26,7 +27,7 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "usage: fawx-android-probe [--substrate recon-rooted-stock|aosp-platform] [--aosp-foreground-event-file PATH] [--aosp-background-supervisor-event-file PATH]";
+const USAGE: &str = "usage: fawx-android-probe [--substrate recon-rooted-stock|aosp-platform] [--aosp-foreground-event-file PATH] [--aosp-background-supervisor-event-file PATH] [--aosp-app-launch-result-file PATH]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeExit {
@@ -40,6 +41,7 @@ enum ProbeArgs {
         substrate: AndroidSubstrate,
         aosp_foreground_event_file: Option<String>,
         aosp_background_supervisor_event_file: Option<String>,
+        aosp_app_launch_result_file: Option<String>,
     },
     Help,
 }
@@ -49,6 +51,7 @@ fn run() -> Result<ProbeExit, Box<dyn Error>> {
         substrate,
         aosp_foreground_event_file,
         aosp_background_supervisor_event_file,
+        aosp_app_launch_result_file,
     } = parse_probe_args(std::env::args().skip(1))?
     else {
         return Ok(ProbeExit::Help);
@@ -60,6 +63,7 @@ fn run() -> Result<ProbeExit, Box<dyn Error>> {
             substrate,
             aosp_foreground_event_file.as_deref(),
             aosp_background_supervisor_event_file.as_deref(),
+            aosp_app_launch_result_file.as_deref(),
         ),
     };
 
@@ -74,6 +78,7 @@ where
     let mut substrate = AndroidSubstrate::ReconRootedStock;
     let mut aosp_foreground_event_file = None;
     let mut aosp_background_supervisor_event_file = None;
+    let mut aosp_app_launch_result_file = None;
     let mut args = args.peekable();
 
     while let Some(arg) = args.next() {
@@ -103,6 +108,15 @@ where
                 }
                 aosp_background_supervisor_event_file = Some(value);
             }
+            "--aosp-app-launch-result-file" => {
+                let value = args
+                    .next()
+                    .ok_or("missing value after --aosp-app-launch-result-file")?;
+                if value.starts_with("--") {
+                    return Err("missing value after --aosp-app-launch-result-file".into());
+                }
+                aosp_app_launch_result_file = Some(value);
+            }
             value if value.starts_with("--") => {
                 return Err(format!("unexpected probe option: {value}").into());
             }
@@ -112,7 +126,9 @@ where
         }
     }
 
-    if (aosp_foreground_event_file.is_some() || aosp_background_supervisor_event_file.is_some())
+    if (aosp_foreground_event_file.is_some()
+        || aosp_background_supervisor_event_file.is_some()
+        || aosp_app_launch_result_file.is_some())
         && substrate != AndroidSubstrate::AospPlatform
     {
         return Err(
@@ -124,6 +140,7 @@ where
         substrate,
         aosp_foreground_event_file,
         aosp_background_supervisor_event_file,
+        aosp_app_launch_result_file,
     })
 }
 
@@ -146,6 +163,7 @@ fn probe_observations(
     substrate: AndroidSubstrate,
     aosp_foreground_event_file: Option<&str>,
     aosp_background_supervisor_event_file: Option<&str>,
+    aosp_app_launch_result_file: Option<&str>,
 ) -> Vec<ProbeObservation> {
     match substrate {
         AndroidSubstrate::ReconRootedStock => vec![
@@ -162,6 +180,8 @@ fn probe_observations(
                 aosp_background_supervisor_event_observation_from_file(
                     aosp_background_supervisor_event_file,
                 );
+            let app_launch_result_observation =
+                aosp_app_launch_result_observation_from_file(aosp_app_launch_result_file);
             vec![
                 aosp_adapter_probe_observation(
                     aosp_foreground_event_file,
@@ -173,6 +193,11 @@ fn probe_observations(
                     &supervisor_event_observation,
                 ),
                 background_supervisor_probe_observation(supervisor_event_observation),
+                aosp_app_controller_probe_observation(
+                    aosp_app_launch_result_file,
+                    &app_launch_result_observation,
+                ),
+                app_launch_probe_observation(app_launch_result_observation),
             ]
         }
     }
@@ -309,6 +334,13 @@ enum AospForegroundEventObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AospBackgroundSupervisorEventObservation {
+    Observed(AndroidObservation),
+    Invalid { reason: String },
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AospAppLaunchResultObservation {
     Observed(AndroidObservation),
     Invalid { reason: String },
     Unavailable,
@@ -459,6 +491,122 @@ fn background_supervisor_unavailable(
     }
 }
 
+fn aosp_app_controller_probe_observation(
+    aosp_app_launch_result_file: Option<&str>,
+    result_observation: &AospAppLaunchResultObservation,
+) -> ProbeObservation {
+    match (aosp_app_launch_result_file, result_observation) {
+        (Some(path), AospAppLaunchResultObservation::Observed(_)) => ProbeObservation {
+            name: "aosp-app-controller".to_string(),
+            ok: true,
+            summary: format!("AOSP app controller result source connected: {path}"),
+            android_observation: None,
+        },
+        (Some(path), AospAppLaunchResultObservation::Invalid { reason }) => ProbeObservation {
+            name: "aosp-app-controller".to_string(),
+            ok: false,
+            summary: format!("AOSP app controller result source invalid: {path}: {reason}"),
+            android_observation: None,
+        },
+        (Some(path), AospAppLaunchResultObservation::Unavailable) => ProbeObservation {
+            name: "aosp-app-controller".to_string(),
+            ok: false,
+            summary: format!("AOSP app controller result source unavailable: {path}"),
+            android_observation: None,
+        },
+        (None, AospAppLaunchResultObservation::Unavailable) => ProbeObservation {
+            name: "aosp-app-controller".to_string(),
+            ok: false,
+            summary: "AOSP app controller is not connected in this terminal binary".to_string(),
+            android_observation: None,
+        },
+        (None, _) => ProbeObservation {
+            name: "aosp-app-controller".to_string(),
+            ok: false,
+            summary: "AOSP app controller state is inconsistent".to_string(),
+            android_observation: None,
+        },
+    }
+}
+
+fn app_launch_probe_observation(
+    result_observation: AospAppLaunchResultObservation,
+) -> ProbeObservation {
+    let observation = match result_observation {
+        AospAppLaunchResultObservation::Observed(observation) => observation,
+        AospAppLaunchResultObservation::Invalid { reason } => {
+            return app_launch_unavailable(format!("app launch unavailable: {reason}"), None);
+        }
+        AospAppLaunchResultObservation::Unavailable => {
+            aosp_app_launch_unavailable_observation("app-launch")
+        }
+    };
+
+    match observation.event().clone() {
+        AndroidEvent::AppLaunchCompleted {
+            package_name,
+            activity_name,
+        } => ProbeObservation {
+            name: "app-launch".to_string(),
+            ok: true,
+            summary: match activity_name {
+                Some(activity) => format!("{package_name}/{activity}"),
+                None => package_name,
+            },
+            android_observation: Some(observation),
+        },
+        AndroidEvent::AppLaunchUnavailable {
+            reason, raw_source, ..
+        } => app_launch_unavailable(
+            match raw_source {
+                Some(raw_source) if !raw_source.is_empty() => {
+                    format!("app launch unavailable: {reason:?}; raw_source={raw_source}")
+                }
+                _ => format!("app launch unavailable: {reason:?}"),
+            },
+            Some(observation),
+        ),
+        _ => app_launch_unavailable(
+            "unexpected app launch observation".to_string(),
+            Some(observation),
+        ),
+    }
+}
+
+fn aosp_app_launch_result_observation_from_file(
+    aosp_app_launch_result_file: Option<&str>,
+) -> AospAppLaunchResultObservation {
+    let Some(path) = aosp_app_launch_result_file else {
+        return AospAppLaunchResultObservation::Unavailable;
+    };
+
+    let result_json = match fs::read_to_string(path) {
+        Ok(result_json) => result_json,
+        Err(error) => {
+            return AospAppLaunchResultObservation::Invalid {
+                reason: format!("failed to read {path}: {error}"),
+            };
+        }
+    };
+
+    match aosp_app_launch_observation_from_platform_result_json(&result_json) {
+        Ok(observation) => AospAppLaunchResultObservation::Observed(observation),
+        Err(error) => AospAppLaunchResultObservation::Invalid { reason: error },
+    }
+}
+
+fn app_launch_unavailable(
+    summary: String,
+    android_observation: Option<AndroidObservation>,
+) -> ProbeObservation {
+    ProbeObservation {
+        name: "app-launch".to_string(),
+        ok: false,
+        summary,
+        android_observation,
+    }
+}
+
 fn foreground_unavailable(
     summary: String,
     android_observation: Option<AndroidObservation>,
@@ -484,7 +632,8 @@ mod tests {
             ProbeArgs::Run {
                 substrate: AndroidSubstrate::ReconRootedStock,
                 aosp_foreground_event_file: None,
-                aosp_background_supervisor_event_file: None
+                aosp_background_supervisor_event_file: None,
+                aosp_app_launch_result_file: None,
             }
         );
     }
@@ -503,7 +652,8 @@ mod tests {
             ProbeArgs::Run {
                 substrate: AndroidSubstrate::AospPlatform,
                 aosp_foreground_event_file: None,
-                aosp_background_supervisor_event_file: None
+                aosp_background_supervisor_event_file: None,
+                aosp_app_launch_result_file: None,
             }
         );
     }
@@ -527,7 +677,8 @@ mod tests {
             ProbeArgs::Run {
                 substrate: AndroidSubstrate::AospPlatform,
                 aosp_foreground_event_file: Some("/run/fawx/foreground.json".to_string()),
-                aosp_background_supervisor_event_file: None
+                aosp_background_supervisor_event_file: None,
+                aosp_app_launch_result_file: None,
             }
         );
     }
@@ -553,7 +704,33 @@ mod tests {
                 aosp_foreground_event_file: None,
                 aosp_background_supervisor_event_file: Some(
                     "/run/fawx/background-supervisor.json".to_string()
-                )
+                ),
+                aosp_app_launch_result_file: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_aosp_app_launch_result_file() {
+        let args = parse_probe_args(
+            [
+                "--substrate",
+                "aosp-platform",
+                "--aosp-app-launch-result-file",
+                "/run/fawx/app-launch.json",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("app launch result file should parse");
+
+        assert_eq!(
+            args,
+            ProbeArgs::Run {
+                substrate: AndroidSubstrate::AospPlatform,
+                aosp_foreground_event_file: None,
+                aosp_background_supervisor_event_file: None,
+                aosp_app_launch_result_file: Some("/run/fawx/app-launch.json".to_string()),
             }
         );
     }
@@ -585,7 +762,7 @@ mod tests {
 
     #[test]
     fn aosp_probe_uses_unavailable_platform_observation_until_adapter_exists() {
-        let observations = probe_observations(AndroidSubstrate::AospPlatform, None, None);
+        let observations = probe_observations(AndroidSubstrate::AospPlatform, None, None, None);
 
         assert!(observations.iter().any(|observation| {
             observation.name == "aosp-platform-adapter"
@@ -609,6 +786,19 @@ mod tests {
                     .map(|value| value.event()),
                 Some(AndroidEvent::BackgroundSupervisorUnavailable {
                     reason: fawx_android_adapter::AndroidBackgroundSupervisorUnavailableReason::AdapterUnavailable,
+                    ..
+                })
+            )
+        }));
+        assert!(observations.iter().any(|observation| {
+            matches!(
+                observation
+                    .android_observation
+                    .as_ref()
+                    .map(|value| value.event()),
+                Some(AndroidEvent::AppLaunchUnavailable {
+                    reason:
+                        fawx_android_adapter::AndroidAppLaunchUnavailableReason::AdapterUnavailable,
                     ..
                 })
             )
@@ -637,6 +827,7 @@ mod tests {
         let observations = probe_observations(
             AndroidSubstrate::AospPlatform,
             Some(event_path.to_str().expect("temp path should be utf8")),
+            None,
             None,
         );
         let _ = std::fs::remove_file(event_path);
@@ -677,6 +868,7 @@ mod tests {
             AndroidSubstrate::AospPlatform,
             Some(event_path.to_str().expect("temp path should be utf8")),
             None,
+            None,
         );
         let _ = std::fs::remove_file(event_path);
 
@@ -715,6 +907,7 @@ mod tests {
             AndroidSubstrate::AospPlatform,
             None,
             Some(event_path.to_str().expect("temp path should be utf8")),
+            None,
         );
         let _ = std::fs::remove_file(event_path);
 
@@ -757,6 +950,7 @@ mod tests {
             AndroidSubstrate::AospPlatform,
             None,
             Some(event_path.to_str().expect("temp path should be utf8")),
+            None,
         );
         let _ = std::fs::remove_file(event_path);
 
@@ -769,6 +963,47 @@ mod tests {
             observation.name == "background-supervisor"
                 && !observation.ok
                 && observation.android_observation.is_none()
+        }));
+    }
+
+    #[test]
+    fn aosp_probe_can_ingest_privileged_app_launch_result_file() {
+        let result_path = std::env::temp_dir().join(format!(
+            "fawx-aosp-app-launch-result-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &result_path,
+            r#"{
+                "package_name": "com.android.settings",
+                "activity_name": "com.android.settings.Settings",
+                "source": {
+                    "service_name": "fawx-system-app-controller",
+                    "event_id": "event-123"
+                }
+            }"#,
+        )
+        .expect("test result should write");
+
+        let observations = probe_observations(
+            AndroidSubstrate::AospPlatform,
+            None,
+            None,
+            Some(result_path.to_str().expect("temp path should be utf8")),
+        );
+        let _ = std::fs::remove_file(result_path);
+
+        assert!(observations.iter().any(|observation| {
+            observation.name == "aosp-app-controller"
+                && observation.ok
+                && observation.summary.contains("result source connected")
+        }));
+        assert!(observations.iter().any(|observation| {
+            matches!(
+                observation.android_observation.as_ref().map(|value| value.event()),
+                Some(AndroidEvent::AppLaunchCompleted { package_name, .. })
+                    if package_name == "com.android.settings"
+            )
         }));
     }
 }
