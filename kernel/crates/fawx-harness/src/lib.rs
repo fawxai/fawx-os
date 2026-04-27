@@ -48,6 +48,8 @@ pub struct RuntimePlatformEventSource {
     pub event_id: String,
 }
 
+pub const AOSP_NOTIFICATION_LISTENER_SERVICE: &str = "fawx-system-notification-listener";
+
 /// Why a runtime observation could not produce the expected foreground state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ForegroundUnavailableReason {
@@ -875,7 +877,14 @@ fn validate_action_target(
             matches!(target, Some(AgentActivityTarget::AndroidPackage { .. }))
         }
         ModelActionKind::Navigate => matches!(target, Some(AgentActivityTarget::Url { .. })),
-        ModelActionKind::Read | ModelActionKind::Write => matches!(
+        ModelActionKind::Read => matches!(
+            target,
+            Some(AgentActivityTarget::File { .. })
+                | Some(AgentActivityTarget::Url { .. })
+                | Some(AgentActivityTarget::Service { .. })
+                | Some(AgentActivityTarget::NotificationSurface)
+        ),
+        ModelActionKind::Write => matches!(
             target,
             Some(AgentActivityTarget::File { .. })
                 | Some(AgentActivityTarget::Url { .. })
@@ -961,6 +970,15 @@ fn safety_requirements_for_action(
     target: &Option<AgentActivityTarget>,
 ) -> Result<Vec<SafetyRequirement>, String> {
     let requirements = match (kind, target) {
+        (
+            ModelActionKind::Observe | ModelActionKind::Verify,
+            Some(AgentActivityTarget::NotificationSurface),
+        ) => {
+            vec![SafetyRequirement::new(
+                SafetyCapability::NotificationsRead,
+                SafetyScope::NotificationSurface,
+            )]
+        }
         (ModelActionKind::Observe | ModelActionKind::Verify, _) => vec![],
         (ModelActionKind::OpenApp, Some(AgentActivityTarget::AndroidPackage { package_name }))
         | (ModelActionKind::Interact, Some(AgentActivityTarget::AndroidPackage { package_name })) =>
@@ -1010,6 +1028,12 @@ fn safety_requirements_for_action(
             vec![SafetyRequirement::new(
                 SafetyCapability::Network,
                 SafetyScope::Service { name: name.clone() },
+            )]
+        }
+        (ModelActionKind::Read, Some(AgentActivityTarget::NotificationSurface)) => {
+            vec![SafetyRequirement::new(
+                SafetyCapability::NotificationsRead,
+                SafetyScope::NotificationSurface,
             )]
         }
         (ModelActionKind::Interact, Some(AgentActivityTarget::Network)) => {
@@ -1637,6 +1661,15 @@ fn action_evidence_for_observation(
         {
             Some(AgentActionEvidence::NetworkAvailable)
         }
+        RuntimeEvent::NotificationReceived { source, summary }
+            if action_accepts_notification_read(action)
+                && observation_has_notification_listener_provenance(observation) =>
+        {
+            Some(AgentActionEvidence::Notification {
+                source: source.clone(),
+                summary: summary.clone(),
+            })
+        }
         RuntimeEvent::RuntimeActionFailed {
             action: name,
             reason,
@@ -1680,6 +1713,26 @@ fn action_accepts_network_available(action: &AgentAction) -> bool {
             AgentActionKind::Observe | AgentActionKind::Verify,
             Some(AgentActivityTarget::Network)
         )
+    )
+}
+
+fn action_accepts_notification_read(action: &AgentAction) -> bool {
+    matches!(
+        (&action.kind, &action.target),
+        (
+            AgentActionKind::Read | AgentActionKind::Observe | AgentActionKind::Verify,
+            Some(AgentActivityTarget::NotificationSurface)
+        )
+    )
+}
+
+fn observation_has_notification_listener_provenance(observation: &RuntimeObservation) -> bool {
+    matches!(
+        &observation.source,
+        RuntimeObservationSource::Android {
+            platform_event_source: Some(RuntimePlatformEventSource { service_name, .. }),
+            ..
+        } if service_name == AOSP_NOTIFICATION_LISTENER_SERVICE
     )
 }
 
@@ -1776,6 +1829,45 @@ mod tests {
             event: RuntimeEvent::ForegroundAppChanged {
                 package_name: package_name.to_string(),
                 activity_name: None,
+            },
+        }
+    }
+
+    fn grant_notification_read(state: &mut TaskState) {
+        state.contract.safety_grants.push(SafetyGrant::scoped(
+            SafetyCapability::NotificationsRead,
+            SafetyScope::NotificationSurface,
+        ));
+    }
+
+    fn notification_observation(source: &str, summary: &str) -> RuntimeObservation {
+        RuntimeObservation {
+            source: RuntimeObservationSource::Android {
+                substrate: "AospPlatform".to_string(),
+                platform_event_source: Some(RuntimePlatformEventSource {
+                    service_name: AOSP_NOTIFICATION_LISTENER_SERVICE.to_string(),
+                    event_id: "event-1".to_string(),
+                }),
+            },
+            event: RuntimeEvent::NotificationReceived {
+                source: source.to_string(),
+                summary: summary.to_string(),
+            },
+        }
+    }
+
+    fn notification_observation_without_listener_provenance(
+        source: &str,
+        summary: &str,
+    ) -> RuntimeObservation {
+        RuntimeObservation {
+            source: RuntimeObservationSource::Android {
+                substrate: "AospPlatform".to_string(),
+                platform_event_source: None,
+            },
+            event: RuntimeEvent::NotificationReceived {
+                source: source.to_string(),
+                summary: summary.to_string(),
             },
         }
     }
@@ -2196,6 +2288,72 @@ mod tests {
     }
 
     #[test]
+    fn notification_reads_require_notification_grant() {
+        let state = TaskState::new_background_task("task-1", "read notifications");
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::Read,
+                target: Some(AgentActivityTarget::NotificationSurface),
+                reason: "read notifications".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("notification read must require notification authority");
+
+        assert!(
+            matches!(error, TaskTransitionError::InvalidAction { reason, .. } if reason.contains("missing safety grant NotificationsRead"))
+        );
+    }
+
+    #[test]
+    fn notification_observe_and_verify_require_notification_grant() {
+        for kind in [ModelActionKind::Observe, ModelActionKind::Verify] {
+            let state = TaskState::new_background_task("task-1", "inspect notifications");
+
+            let error = accept_model_action_proposal(
+                state,
+                ModelActionProposal {
+                    kind,
+                    target: Some(AgentActivityTarget::NotificationSurface),
+                    reason: "inspect notifications".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                },
+            )
+            .expect_err("notification observation must require notification authority");
+
+            assert!(
+                matches!(error, TaskTransitionError::InvalidAction { reason, .. } if reason.contains("missing safety grant NotificationsRead"))
+            );
+        }
+    }
+
+    #[test]
+    fn notification_surface_rejects_interact_until_interaction_semantics_exist() {
+        let mut state = TaskState::new_background_task("task-1", "interact with notifications");
+        grant_notification_read(&mut state);
+
+        let error = accept_model_action_proposal(
+            state,
+            ModelActionProposal {
+                kind: ModelActionKind::Interact,
+                target: Some(AgentActivityTarget::NotificationSurface),
+                reason: "interact with a notification".to_string(),
+                expected_observation: None,
+                proposal_id: None,
+            },
+        )
+        .expect_err("notification interaction has no closure contract yet");
+
+        assert!(
+            matches!(error, TaskTransitionError::InvalidAction { reason, .. } if reason.contains("compatible typed target"))
+        );
+    }
+
+    #[test]
     fn interact_url_requires_network_url_grant() {
         let state = TaskState::new_background_task("task-1", "click docs");
 
@@ -2506,6 +2664,102 @@ mod tests {
                 if package_name == "com.android.settings"
         ));
         assert_eq!(state.last_runtime_observation, Some(observation));
+    }
+
+    #[test]
+    fn observe_current_action_records_matching_notification_evidence() {
+        let mut state = TaskState::new_background_task("task-1", "read notifications");
+        grant_notification_read(&mut state);
+        let state = begin_current_action_execution(
+            accept_model_action_proposal(
+                state,
+                ModelActionProposal {
+                    kind: ModelActionKind::Read,
+                    target: Some(AgentActivityTarget::NotificationSurface),
+                    reason: "read notifications".to_string(),
+                    expected_observation: Some("a notification is available".to_string()),
+                    proposal_id: None,
+                },
+            )
+            .expect("accept action"),
+        )
+        .expect("begin action");
+        let observation = notification_observation("com.example.mail", "New message from Ada");
+
+        let state = observe_current_action(state, &observation).expect("observe action");
+        let action = state.current_action.expect("current action");
+
+        assert_eq!(action.status, AgentActionStatus::Observed);
+        assert_eq!(action.boundary.state, ActionBoundaryState::Committed);
+        assert!(matches!(
+            action.last_observation.as_ref().map(|value| &value.evidence),
+            Some(AgentActionEvidence::Notification { source, summary })
+                if source == "com.example.mail" && summary == "New message from Ada"
+        ));
+        assert_eq!(state.last_runtime_observation, Some(observation));
+    }
+
+    #[test]
+    fn observe_current_action_does_not_close_notification_for_unrelated_target() {
+        let state = begin_current_action_execution(
+            accept_model_action_proposal(
+                task_with_app_control("task-1", "open settings", "com.android.settings"),
+                ModelActionProposal {
+                    kind: ModelActionKind::OpenApp,
+                    target: Some(AgentActivityTarget::AndroidPackage {
+                        package_name: "com.android.settings".to_string(),
+                    }),
+                    reason: "open settings".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                },
+            )
+            .expect("accept action"),
+        )
+        .expect("begin action");
+
+        let state = observe_current_action(
+            state,
+            &notification_observation("com.example.mail", "New message from Ada"),
+        )
+        .expect("observe action");
+        let action = state.current_action.expect("current action");
+
+        assert_eq!(action.status, AgentActionStatus::Executing);
+        assert!(action.last_observation.is_none());
+    }
+
+    #[test]
+    fn observe_current_action_does_not_close_notification_without_listener_provenance() {
+        let mut state = TaskState::new_background_task("task-1", "read notifications");
+        grant_notification_read(&mut state);
+        let state = begin_current_action_execution(
+            accept_model_action_proposal(
+                state,
+                ModelActionProposal {
+                    kind: ModelActionKind::Read,
+                    target: Some(AgentActivityTarget::NotificationSurface),
+                    reason: "read notifications".to_string(),
+                    expected_observation: None,
+                    proposal_id: None,
+                },
+            )
+            .expect("accept action"),
+        )
+        .expect("begin action");
+
+        let state = observe_current_action(
+            state,
+            &notification_observation_without_listener_provenance(
+                "com.example.mail",
+                "New message from Ada",
+            ),
+        )
+        .expect("observe action");
+        let action = state.current_action.expect("current action");
+
+        assert_eq!(action.status, AgentActionStatus::Executing);
+        assert!(action.last_observation.is_none());
     }
 
     #[test]

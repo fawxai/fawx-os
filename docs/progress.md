@@ -27,6 +27,7 @@ This list tracks the remaining gates before we can call the rooted Android proto
 - AOSP background execution now has a typed supervisor heartbeat ingest seam: adb/recon process survival still does not count as platform supervision, and only `fawx-system-background-supervisor` provenance can produce an AOSP supervisor heartbeat.
 - AOSP app launch/resume now has a typed app-controller result ingest seam: `monkey` remains rooted-stock recon only, and only `fawx-system-app-controller` provenance can produce an AOSP app-launch success.
 - AOSP notification read now has a typed notification-listener ingest seam: notification scraping remains non-platform evidence, and only `fawx-system-notification-listener` provenance can produce an AOSP notification event.
+- Notification reads now close through the typed action spine: `NotificationSurface` requires `NotificationsRead`, and `NotificationReceived` evidence can move an executing notification read action to `Observed`.
 
 ## Remaining
 
