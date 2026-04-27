@@ -2,14 +2,19 @@ use std::error::Error;
 use std::process::ExitCode;
 
 use fawx_android_adapter::{
-    AndroidEvent, AndroidObservation, AndroidReconCommand, AndroidSubstrate,
+    AndroidCapabilityStatusEntry, AndroidEvent, AndroidObservation, AndroidReconCommand,
+    AndroidSubstrate, android_capability_statuses, aosp_platform_adapter_unavailable_observation,
     foreground_observation, run_recon_command,
 };
 use serde::Serialize;
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(ProbeExit::Success) => ExitCode::SUCCESS,
+        Ok(ProbeExit::Help) => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
@@ -17,25 +22,63 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
+const USAGE: &str = "usage: fawx-android-probe [--substrate recon-rooted-stock|aosp-platform]";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeExit {
+    Success,
+    Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeArgs {
+    Run { substrate: AndroidSubstrate },
+    Help,
+}
+
+fn run() -> Result<ProbeExit, Box<dyn Error>> {
+    let ProbeArgs::Run { substrate } = parse_probe_args(std::env::args().skip(1))? else {
+        return Ok(ProbeExit::Help);
+    };
     let report = ProbeReport {
-        substrate: AndroidSubstrate::ReconRootedStock,
-        observations: vec![
-            command_observation("whoami", AndroidReconCommand::Whoami),
-            command_observation("id", AndroidReconCommand::Id),
-            command_observation("uname", AndroidReconCommand::Uname),
-            root_observation(),
-            foreground_probe_observation(),
-        ],
+        substrate,
+        capability_statuses: android_capability_statuses(substrate),
+        observations: probe_observations(substrate),
     };
 
     println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
+    Ok(ProbeExit::Success)
+}
+
+fn parse_probe_args<I>(mut args: I) -> Result<ProbeArgs, Box<dyn Error>>
+where
+    I: Iterator<Item = String>,
+{
+    let Some(first) = args.next() else {
+        return Ok(ProbeArgs::Run {
+            substrate: AndroidSubstrate::ReconRootedStock,
+        });
+    };
+
+    let value = match first.as_str() {
+        "--substrate" => args.next().ok_or("missing value after --substrate")?,
+        "--help" | "-h" => return Ok(ProbeArgs::Help),
+        value => value.to_string(),
+    };
+
+    if args.next().is_some() {
+        return Err("unexpected extra arguments".into());
+    }
+
+    Ok(ProbeArgs::Run {
+        substrate: value.parse()?,
+    })
 }
 
 #[derive(Debug, Serialize)]
 struct ProbeReport {
     substrate: AndroidSubstrate,
+    capability_statuses: Vec<AndroidCapabilityStatusEntry>,
     observations: Vec<ProbeObservation>,
 }
 
@@ -45,6 +88,22 @@ struct ProbeObservation {
     ok: bool,
     summary: String,
     android_observation: Option<AndroidObservation>,
+}
+
+fn probe_observations(substrate: AndroidSubstrate) -> Vec<ProbeObservation> {
+    match substrate {
+        AndroidSubstrate::ReconRootedStock => vec![
+            command_observation("whoami", AndroidReconCommand::Whoami),
+            command_observation("id", AndroidReconCommand::Id),
+            command_observation("uname", AndroidReconCommand::Uname),
+            root_observation(),
+            foreground_probe_observation(substrate),
+        ],
+        AndroidSubstrate::AospPlatform => vec![
+            aosp_adapter_probe_observation(),
+            foreground_probe_observation(substrate),
+        ],
+    }
 }
 
 fn command_observation(name: &str, command: AndroidReconCommand) -> ProbeObservation {
@@ -79,8 +138,22 @@ fn root_observation() -> ProbeObservation {
     }
 }
 
-fn foreground_probe_observation() -> ProbeObservation {
-    let observation = foreground_observation(AndroidSubstrate::ReconRootedStock);
+fn aosp_adapter_probe_observation() -> ProbeObservation {
+    ProbeObservation {
+        name: "aosp-platform-adapter".to_string(),
+        ok: false,
+        summary: "AOSP platform adapter is not connected in this terminal binary".to_string(),
+        android_observation: None,
+    }
+}
+
+fn foreground_probe_observation(substrate: AndroidSubstrate) -> ProbeObservation {
+    let observation = match substrate {
+        AndroidSubstrate::ReconRootedStock => foreground_observation(substrate),
+        AndroidSubstrate::AospPlatform => {
+            aosp_platform_adapter_unavailable_observation("foreground")
+        }
+    };
 
     match observation.event.clone() {
         AndroidEvent::ForegroundAppChanged {
@@ -126,5 +199,67 @@ fn foreground_unavailable(
         ok: false,
         summary,
         android_observation,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_probe_to_rooted_stock_recon() {
+        let args = parse_probe_args(std::iter::empty()).expect("default substrate should parse");
+
+        assert_eq!(
+            args,
+            ProbeArgs::Run {
+                substrate: AndroidSubstrate::ReconRootedStock
+            }
+        );
+    }
+
+    #[test]
+    fn parses_explicit_aosp_substrate_arg() {
+        let args = parse_probe_args(
+            ["--substrate", "aosp-platform"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("aosp substrate should parse");
+
+        assert_eq!(
+            args,
+            ProbeArgs::Run {
+                substrate: AndroidSubstrate::AospPlatform
+            }
+        );
+    }
+
+    #[test]
+    fn parses_help_as_successful_probe_exit() {
+        let args = parse_probe_args(["--help"].into_iter().map(str::to_string))
+            .expect("help should parse");
+
+        assert_eq!(args, ProbeArgs::Help);
+    }
+
+    #[test]
+    fn aosp_probe_uses_unavailable_platform_observation_until_adapter_exists() {
+        let observations = probe_observations(AndroidSubstrate::AospPlatform);
+
+        assert!(observations.iter().any(|observation| {
+            observation.name == "aosp-platform-adapter"
+                && !observation.ok
+                && observation.summary.contains("not connected")
+        }));
+        assert!(observations.iter().any(|observation| {
+            matches!(
+                observation.android_observation.as_ref().map(|value| &value.event),
+                Some(AndroidEvent::ForegroundObservationUnavailable {
+                    reason: fawx_android_adapter::AndroidForegroundUnavailableReason::AdapterUnavailable,
+                    ..
+                })
+            )
+        }));
     }
 }

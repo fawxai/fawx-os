@@ -6,7 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::fmt;
 use std::process::Command;
+use std::str::FromStr;
 
 /// Which Android-facing substrate produced an observation or accepts a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,6 +18,48 @@ pub enum AndroidSubstrate {
     ReconRootedStock,
     /// The real prototype target: AOSP-level platform control.
     AospPlatform,
+}
+
+impl AndroidSubstrate {
+    pub fn as_wire_name(self) -> &'static str {
+        match self {
+            Self::ReconRootedStock => "ReconRootedStock",
+            Self::AospPlatform => "AospPlatform",
+        }
+    }
+
+    pub fn parse_name(name: &str) -> Option<Self> {
+        let normalized = name
+            .trim()
+            .chars()
+            .filter(|ch| *ch != '-' && *ch != '_' && !ch.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+
+        match normalized.as_str() {
+            "recon" | "rootedstock" | "reconrootedstock" => Some(Self::ReconRootedStock),
+            "aosp" | "aospplatform" | "system" | "platform" => Some(Self::AospPlatform),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for AndroidSubstrate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_wire_name())
+    }
+}
+
+impl FromStr for AndroidSubstrate {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse_name(value).ok_or_else(|| {
+            format!(
+                "unknown Android substrate '{value}'; expected recon-rooted-stock or aosp-platform"
+            )
+        })
+    }
 }
 
 /// The durable Android capability categories the runtime can reason about.
@@ -71,6 +115,13 @@ pub struct AndroidCapabilityEntry {
     pub capability: AndroidCapability,
     pub rooted_stock: AndroidCapabilityStatus,
     pub aosp_platform: AndroidCapabilityStatus,
+    pub note: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AndroidCapabilityStatusEntry {
+    pub capability: AndroidCapability,
+    pub status: AndroidCapabilityStatus,
     pub note: &'static str,
 }
 
@@ -184,6 +235,22 @@ pub fn android_capability_status(
     })
 }
 
+pub fn android_capability_statuses(
+    substrate: AndroidSubstrate,
+) -> Vec<AndroidCapabilityStatusEntry> {
+    ANDROID_CAPABILITY_MAP
+        .iter()
+        .map(|entry| AndroidCapabilityStatusEntry {
+            capability: entry.capability,
+            status: match substrate {
+                AndroidSubstrate::ReconRootedStock => entry.rooted_stock,
+                AndroidSubstrate::AospPlatform => entry.aosp_platform,
+            },
+            note: entry.note,
+        })
+        .collect()
+}
+
 /// Observations flowing upward from Android into the Fawx OS runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AndroidEvent {
@@ -220,6 +287,7 @@ pub enum AndroidForegroundUnavailableReason {
     CommandFailed,
     EmptyOutput,
     ParseFailed,
+    AdapterUnavailable,
 }
 
 /// Commands flowing downward from the runtime into the Android adapter.
@@ -554,13 +622,39 @@ pub fn parse_foreground_target(line: &str) -> Option<ForegroundTarget> {
 }
 
 pub fn foreground_observation(substrate: AndroidSubstrate) -> AndroidObservation {
-    foreground_observation_from_output(substrate, run_command_output(&foreground_focus_command()))
+    match substrate {
+        AndroidSubstrate::ReconRootedStock => foreground_observation_from_output(
+            substrate,
+            run_command_output(&foreground_focus_command()),
+        ),
+        AndroidSubstrate::AospPlatform => {
+            aosp_platform_adapter_unavailable_observation("foreground")
+        }
+    }
+}
+
+pub fn aosp_platform_adapter_unavailable_observation(target: &str) -> AndroidObservation {
+    AndroidObservation {
+        substrate: AndroidSubstrate::AospPlatform,
+        event: AndroidEvent::ForegroundObservationUnavailable {
+            target: target.to_string(),
+            reason: AndroidForegroundUnavailableReason::AdapterUnavailable,
+            raw_source: Some(
+                "AOSP platform adapter is not connected; shell recon evidence must stay on ReconRootedStock"
+                    .to_string(),
+            ),
+        },
+    }
 }
 
 pub fn foreground_observation_from_result(
     substrate: AndroidSubstrate,
     command_result: Result<String, String>,
 ) -> AndroidObservation {
+    if substrate == AndroidSubstrate::AospPlatform {
+        return aosp_platform_adapter_unavailable_observation("foreground");
+    }
+
     match command_result
         .map_err(ForegroundObservationFailure::CommandFailed)
         .and_then(|summary| {
@@ -601,6 +695,10 @@ pub fn foreground_observation_from_output(
     substrate: AndroidSubstrate,
     command_result: Result<CommandOutput, String>,
 ) -> AndroidObservation {
+    if substrate == AndroidSubstrate::AospPlatform {
+        return aosp_platform_adapter_unavailable_observation("foreground");
+    }
+
     match command_result {
         Ok(output) if !output.success => unavailable_foreground(
             substrate,
@@ -838,6 +936,48 @@ mod tests {
                 "missing capability map entry for {capability:?}"
             );
         }
+    }
+
+    #[test]
+    fn parses_android_substrate_names_without_stringly_call_sites() {
+        assert_eq!(
+            "recon-rooted-stock".parse::<AndroidSubstrate>(),
+            Ok(AndroidSubstrate::ReconRootedStock)
+        );
+        assert_eq!(
+            "ReconRootedStock".parse::<AndroidSubstrate>(),
+            Ok(AndroidSubstrate::ReconRootedStock)
+        );
+        assert_eq!(
+            "aosp-platform".parse::<AndroidSubstrate>(),
+            Ok(AndroidSubstrate::AospPlatform)
+        );
+        assert_eq!(
+            "system".parse::<AndroidSubstrate>(),
+            Ok(AndroidSubstrate::AospPlatform)
+        );
+        assert!("stock".parse::<AndroidSubstrate>().is_err());
+    }
+
+    #[test]
+    fn capability_statuses_project_each_substrate_from_same_map() {
+        let recon = android_capability_statuses(AndroidSubstrate::ReconRootedStock);
+        let aosp = android_capability_statuses(AndroidSubstrate::AospPlatform);
+
+        assert_eq!(recon.len(), AndroidCapability::ALL.len());
+        assert_eq!(aosp.len(), AndroidCapability::ALL.len());
+        assert!(recon.iter().any(|entry| {
+            entry.capability == AndroidCapability::RootShell
+                && entry.status == AndroidCapabilityStatus::Limited
+        }));
+        assert!(aosp.iter().any(|entry| {
+            entry.capability == AndroidCapability::RootShell
+                && entry.status == AndroidCapabilityStatus::Unavailable
+        }));
+        assert!(aosp.iter().any(|entry| {
+            entry.capability == AndroidCapability::PlaceCall
+                && entry.status == AndroidCapabilityStatus::Available
+        }));
     }
 
     #[test]
@@ -1165,6 +1305,63 @@ mod tests {
             AndroidEvent::ForegroundObservationUnavailable {
                 reason: AndroidForegroundUnavailableReason::ParseFailed,
                 raw_source: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn aosp_platform_probe_does_not_relabel_shell_recon_as_platform_evidence() {
+        let observation = aosp_platform_adapter_unavailable_observation("foreground");
+
+        let AndroidEvent::ForegroundObservationUnavailable {
+            reason, raw_source, ..
+        } = observation.event
+        else {
+            panic!("expected unavailable foreground observation");
+        };
+
+        assert_eq!(observation.substrate, AndroidSubstrate::AospPlatform);
+        assert_eq!(
+            reason,
+            AndroidForegroundUnavailableReason::AdapterUnavailable
+        );
+        assert!(
+            raw_source
+                .expect("raw source")
+                .contains("shell recon evidence must stay on ReconRootedStock")
+        );
+    }
+
+    #[test]
+    fn aosp_foreground_primitives_refuse_to_parse_shell_output_as_platform_evidence() {
+        let dumpsys = Ok(CommandOutput {
+            stdout: "mCurrentFocus=Window{39760e7 u0 com.android.settings/.Settings}\n".to_string(),
+            stderr: String::new(),
+            status: "exit status: 0".to_string(),
+            success: true,
+        });
+        let observation =
+            foreground_observation_from_output(AndroidSubstrate::AospPlatform, dumpsys);
+
+        assert_eq!(observation.substrate, AndroidSubstrate::AospPlatform);
+        assert!(matches!(
+            observation.event,
+            AndroidEvent::ForegroundObservationUnavailable {
+                reason: AndroidForegroundUnavailableReason::AdapterUnavailable,
+                ..
+            }
+        ));
+
+        let observation = foreground_observation_from_result(
+            AndroidSubstrate::AospPlatform,
+            Ok("mCurrentFocus=Window{39760e7 u0 com.android.settings/.Settings}".to_string()),
+        );
+
+        assert!(matches!(
+            observation.event,
+            AndroidEvent::ForegroundObservationUnavailable {
+                reason: AndroidForegroundUnavailableReason::AdapterUnavailable,
                 ..
             }
         ));

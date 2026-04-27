@@ -23,3 +23,8 @@ previous device artifacts.
 model-candidate path on a connected Pixel by piping `suggest open settings`,
 `approve last`, explicit `approve <task-id>`, and `quit` into
 `fawx-terminal-runner session`.
+
+`./scripts/pixel-substrate-compare-smoke.sh` runs the Android probe in both
+`ReconRootedStock` and `AospPlatform` modes. The AOSP mode intentionally reports
+platform observations as unavailable until a real privileged adapter exists; it
+is a boundary test, not a fake AOSP implementation.

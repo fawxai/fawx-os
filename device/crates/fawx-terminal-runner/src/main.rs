@@ -1502,6 +1502,9 @@ fn runtime_observation_from_android(observation: &AndroidObservation) -> Runtime
                     AndroidForegroundUnavailableReason::ParseFailed => {
                         ForegroundUnavailableReason::ParseFailed
                     }
+                    AndroidForegroundUnavailableReason::AdapterUnavailable => {
+                        ForegroundUnavailableReason::AdapterUnavailable
+                    }
                 },
                 raw_source: raw_source.clone(),
             },
@@ -2356,6 +2359,28 @@ mod tests {
         let action = task.state.current_action.expect("current action");
         assert_eq!(action.status, AgentActionStatus::Observed);
         assert_eq!(sleep_count, 1);
+    }
+
+    #[test]
+    fn aosp_adapter_unavailable_maps_to_runtime_observation_without_losing_reason() {
+        let android_observation =
+            fawx_android_adapter::aosp_platform_adapter_unavailable_observation("foreground");
+
+        let runtime_observation = runtime_observation_from_android(&android_observation);
+
+        assert_eq!(
+            runtime_observation.source,
+            RuntimeObservationSource::Android {
+                substrate: "AospPlatform".to_string()
+            }
+        );
+        assert!(matches!(
+            runtime_observation.event,
+            RuntimeEvent::ForegroundUnavailable {
+                reason: ForegroundUnavailableReason::AdapterUnavailable,
+                ..
+            }
+        ));
     }
 
     #[test]
