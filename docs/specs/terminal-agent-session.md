@@ -24,6 +24,9 @@ The session supports:
 - `open settings`
 - `open launcher`
 - `open package <android.package>`
+- `suggest open settings`
+- `approve last`
+- `approve <task-id>`
 - `list`
 - `help`
 - `quit`
@@ -78,6 +81,9 @@ The session source is typed:
   a separate owner-confirmation path adds the grant.
 - A `ModelCandidate` without matching policy creates a typed owner-approval
   handoff instead of falling through into execution.
+- `approve last` and `approve <task-id>` complete that handoff, consume the
+  stored `pending_intent_approval`, install the exact missing safety grants,
+  accept the original candidate, and then execute/observe the action.
 
 The rest of the session flow should stay the same:
 
@@ -87,3 +93,20 @@ owner/model intent -> typed action proposal -> runtime execution -> observation 
 
 That keeps the model below the control plane instead of making prompt text the
 source of authority.
+
+## Pixel Smoke
+
+`./scripts/pixel-model-approval-smoke.sh` pipes an interactive session into the
+Pixel and checks both approval paths:
+
+```text
+suggest open settings
+approve last
+quit
+approve <task-id>
+quit
+```
+
+The smoke passes only if the model candidate pauses for approval, approval
+accepts the stored candidate action, the Android launch command succeeds, and
+foreground evidence closes the approved action.
