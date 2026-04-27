@@ -207,19 +207,21 @@ This table is mirrored as typed data in `fawx-android-adapter` so tests and runt
 
 | Capability | Rooted stock Android | AOSP/system privileges | Contract note |
 | --- | --- | --- | --- |
-| Observe foreground app | Available | Available | Recon can use `dumpsys window`; AOSP should expose stable platform events. |
-| Launch app | Limited | Available | Recon can probe activity-manager commands; reliable launch/resume belongs in a privileged adapter. |
-| Control foreground app | Limited | Available | Recon UI control is fragile; durable control needs accessibility, shell, or framework integration. |
-| Read notifications | Limited | Available | Production needs notification listener or system hook semantics. |
-| Post notifications | Requires AOSP privilege | Available | User-visible OS notifications are platform actions, not shell strings. |
-| Place call | Requires AOSP privilege | Available | Telephony side effects require explicit kernel/user authority. |
-| Send message | Requires AOSP privilege | Available | Messaging side effects require explicit kernel/user authority. |
-| Read shared storage | Limited | Available | Recon can read shell-accessible paths; production needs scoped storage policy. |
-| Write shared storage | Limited | Available | Recon writes are path-limited and risky; AOSP should mediate writes through grants. |
+| Observe foreground app | Available | Unavailable | Recon can use `dumpsys window`; AOSP should expose stable platform events, but no connected adapter exists yet. |
+| Launch app | Limited | Unavailable | Recon can probe activity-manager commands; reliable launch/resume belongs in a privileged adapter. |
+| Control foreground app | Limited | Unavailable | Recon UI control is fragile; durable control needs accessibility, shell, or framework integration. |
+| Read notifications | Limited | Unavailable | Production needs notification listener or system hook semantics. |
+| Post notifications | Requires AOSP privilege | Unavailable | User-visible OS notifications are platform actions, not shell strings. |
+| Place call | Requires AOSP privilege | Unavailable | Telephony side effects require explicit kernel/user authority. |
+| Send message | Requires AOSP privilege | Unavailable | Messaging side effects require explicit kernel/user authority. |
+| Read runtime scratch storage | Available | Available | Runtime-owned scratch storage under `/data/local/tmp/fawx-os` is a prototype evidence surface, not Android shared storage. |
+| Write runtime scratch storage | Available | Available | Runtime-owned scratch storage under `/data/local/tmp/fawx-os` is a prototype evidence surface, not Android shared storage. |
+| Read shared storage | Limited | Unavailable | Recon can read some shell-accessible paths; production still needs scoped storage policy. |
+| Write shared storage | Limited | Unavailable | Recon writes are path-limited and risky; production still needs scoped storage policy. |
 | Network access | Available | Available | Available does not mean ungated; task policy still grants or denies. |
-| Background execution | Limited | Available | Recon detached shell processes are useful evidence, not the final supervisor model. |
-| Install packages | Limited | Available | Package install depends on device policy until we own the package-manager boundary. |
-| System settings | Limited | Available | Recon can inspect or poke some settings; production needs typed framework APIs. |
+| Background execution | Limited | Unavailable | Recon detached shell processes are useful evidence, not the final supervisor model. |
+| Install packages | Limited | Unavailable | Package install depends on device policy until we own the package-manager boundary. |
+| System settings | Limited | Unavailable | Recon can inspect or poke some settings; production needs typed framework APIs. |
 | Root shell | Limited | Unavailable | Root shell is a recon escape hatch, not a production OS primitive. |
 
 ## AOSP Comparison Probe

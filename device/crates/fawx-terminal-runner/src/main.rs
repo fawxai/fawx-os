@@ -134,6 +134,10 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             let summary = joined_tail(&args, 3, "notification summary")?;
             run_observe_notification(&store, task_id, source, summary)?;
         }
+        "android-command" => {
+            let command = parse_android_command(&args[1..])?;
+            run_android_command(command)?;
+        }
         "local-model-probe" => {
             run_local_model_probe()?;
         }
@@ -1050,6 +1054,108 @@ fn run_observe_notification(
     Ok(())
 }
 
+fn run_android_command(command: AndroidCommand) -> Result<(), Box<dyn Error>> {
+    let request = AndroidActionRequest {
+        substrate: AndroidSubstrate::ReconRootedStock,
+        command,
+    };
+    let output = execute_android_action_request(&request)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "request": request,
+            "execution": command_output_value(&output),
+        }))?
+    );
+    if !output.success {
+        return Err(format!(
+            "android command failed: {}",
+            command_output_summary(&output)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn parse_android_command(args: &[String]) -> Result<AndroidCommand, String> {
+    let subcommand = args
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| "android-command requires a subcommand".to_string())?;
+    match subcommand {
+        "keyevent" => Ok(AndroidCommand::InputKeyEvent {
+            key_code: required_slice_arg(args, 1, "key code")?.to_string(),
+        }),
+        "tap" => Ok(AndroidCommand::InputTap {
+            x: parse_u32_arg(args, 1, "x")?,
+            y: parse_u32_arg(args, 2, "y")?,
+        }),
+        "text" => Ok(AndroidCommand::InputText {
+            text: joined_slice_tail(args, 1, "text")?,
+        }),
+        "swipe" => Ok(AndroidCommand::InputSwipe {
+            x1: parse_u32_arg(args, 1, "x1")?,
+            y1: parse_u32_arg(args, 2, "y1")?,
+            x2: parse_u32_arg(args, 3, "x2")?,
+            y2: parse_u32_arg(args, 4, "y2")?,
+            duration_ms: optional_u32_arg(args, 5)?,
+        }),
+        "write-file" => Ok(AndroidCommand::WriteScopedFile {
+            path: required_slice_arg(args, 1, "path")?.to_string(),
+            contents: joined_slice_tail(args, 2, "contents")?,
+        }),
+        "read-file" => Ok(AndroidCommand::ReadScopedFile {
+            path: required_slice_arg(args, 1, "path")?.to_string(),
+        }),
+        "post-notification" => Ok(AndroidCommand::PostNotification {
+            title: required_slice_arg(args, 1, "title")?.to_string(),
+            body: joined_slice_tail(args, 2, "body")?,
+        }),
+        "send-message" => Ok(AndroidCommand::SendMessage {
+            contact: required_slice_arg(args, 1, "contact")?.to_string(),
+            body: joined_slice_tail(args, 2, "body")?,
+        }),
+        "place-call" => Ok(AndroidCommand::PlaceCall {
+            number: required_slice_arg(args, 1, "number")?.to_string(),
+        }),
+        _ => Err(format!("unknown android-command subcommand: {subcommand}")),
+    }
+}
+
+fn required_slice_arg<'a>(
+    args: &'a [String],
+    index: usize,
+    label: &str,
+) -> Result<&'a str, String> {
+    args.get(index)
+        .map(String::as_str)
+        .ok_or_else(|| format!("missing {label}"))
+}
+
+fn joined_slice_tail(args: &[String], index: usize, label: &str) -> Result<String, String> {
+    if args.len() <= index {
+        return Err(format!("missing {label}"));
+    }
+    Ok(args[index..].join(" "))
+}
+
+fn parse_u32_arg(args: &[String], index: usize, label: &str) -> Result<u32, String> {
+    let value = required_slice_arg(args, index, label)?;
+    value
+        .parse()
+        .map_err(|error| format!("invalid {label} '{value}': {error}"))
+}
+
+fn optional_u32_arg(args: &[String], index: usize) -> Result<Option<u32>, String> {
+    match args.get(index) {
+        Some(value) => value
+            .parse()
+            .map(Some)
+            .map_err(|error| format!("invalid integer '{value}': {error}")),
+        None => Ok(None),
+    }
+}
+
 fn run_local_model_probe() -> Result<(), Box<dyn Error>> {
     let report = local_model_probe(AndroidSubstrate::ReconRootedStock);
     println!("{}", local_model_probe_json(&report)?);
@@ -1225,8 +1331,17 @@ fn android_command_label(command: &AndroidCommand) -> &'static str {
         AndroidCommand::AcquireForeground { .. } => "acquire-foreground",
         AndroidCommand::ReleaseForeground => "release-foreground",
         AndroidCommand::ObserveNotifications { .. } => "observe-notifications",
+        AndroidCommand::PostNotification { .. } => "post-notification",
         AndroidCommand::QueryForegroundState => "query-foreground-state",
         AndroidCommand::ResumeAppSurface { .. } => "resume-app-surface",
+        AndroidCommand::InputKeyEvent { .. } => "input-keyevent",
+        AndroidCommand::InputTap { .. } => "input-tap",
+        AndroidCommand::InputText { .. } => "input-text",
+        AndroidCommand::InputSwipe { .. } => "input-swipe",
+        AndroidCommand::ReadScopedFile { .. } => "read-runtime-scratch-file",
+        AndroidCommand::WriteScopedFile { .. } => "write-runtime-scratch-file",
+        AndroidCommand::SendMessage { .. } => "send-message",
+        AndroidCommand::PlaceCall { .. } => "place-call",
         AndroidCommand::PerformRootedAction { .. } => "perform-rooted-action",
     }
 }
@@ -1891,6 +2006,12 @@ fn print_usage() {
     eprintln!(
         "  fawx-terminal-runner observe-notification <task-id> <source-package> <summary>  # manual shell evidence, not AOSP listener proof"
     );
+    eprintln!(
+        "  fawx-terminal-runner android-command keyevent <KEY>|tap <x> <y>|text <text>|swipe <x1> <y1> <x2> <y2> [duration-ms]"
+    );
+    eprintln!(
+        "  fawx-terminal-runner android-command read-file <path>|write-file <path> <contents>|post-notification <title> <body>|send-message <contact> <body>|place-call <number>"
+    );
     eprintln!("  fawx-terminal-runner local-model-probe");
     eprintln!("  fawx-terminal-runner candidate-dry-run <prompt>");
     eprintln!("  fawx-terminal-runner session");
@@ -2206,6 +2327,53 @@ mod tests {
             action.target,
             Some(AgentActivityTarget::NotificationSurface)
         ));
+    }
+
+    #[test]
+    fn android_command_parser_supports_input_and_scoped_storage() {
+        assert_eq!(
+            parse_android_command(&["keyevent".to_string(), "KEYCODE_HOME".to_string()])
+                .expect("keyevent"),
+            AndroidCommand::InputKeyEvent {
+                key_code: "KEYCODE_HOME".to_string()
+            }
+        );
+        assert_eq!(
+            parse_android_command(&[
+                "write-file".to_string(),
+                "/data/local/tmp/fawx-os/probes/storage.txt".to_string(),
+                "hello".to_string(),
+                "world".to_string(),
+            ])
+            .expect("write file"),
+            AndroidCommand::WriteScopedFile {
+                path: "/data/local/tmp/fawx-os/probes/storage.txt".to_string(),
+                contents: "hello world".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn android_command_parser_supports_sensitive_unavailable_surfaces() {
+        assert_eq!(
+            parse_android_command(&[
+                "send-message".to_string(),
+                "Ada".to_string(),
+                "hello".to_string(),
+            ])
+            .expect("send message"),
+            AndroidCommand::SendMessage {
+                contact: "Ada".to_string(),
+                body: "hello".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_android_command(&["place-call".to_string(), "+15555550100".to_string()])
+                .expect("place call"),
+            AndroidCommand::PlaceCall {
+                number: "+15555550100".to_string(),
+            }
+        );
     }
 
     #[test]

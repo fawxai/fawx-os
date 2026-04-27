@@ -34,11 +34,14 @@ This list tracks the remaining gates before we can call the rooted Android proto
 - The first real AOSP prototype plan is written: foreground observation is the first platform primitive, and AOSP must prove it with `fawx-system-foreground-observer` rather than shell or `dumpsys`.
 - AOSP workspace preflight scripts exist and keep AOSP source/build artifacts outside this repository.
 - The substrate decision sprint now provides a no-capital gate before AOSP checkout/build investment. It runs the rooted Pixel substrate smoke, real-task harness, AOSP-unavailable assertions, and local model probe, then emits a JSON recommendation over the must-have agent-phone primitives.
+- Rooted-stock control gates now cover typed input commands, runtime scratch storage read/write, local model package probing, sensitive notification/communication unavailable contracts, and the human approval smoke through `pixel-control-gates-smoke.sh`.
 
 ## Remaining
 
 - AOSP checkout is blocked locally until enough disk is available and the Pixel bootloader unlock/flash path is intentionally taken.
 - Local model inference is not connected yet. The current terminal session uses deterministic intent parsing so the runtime contract can be tested before model quality is introduced.
 - If AICore/Gemini Nano exposes a supported API surface, add it as a provider adapter that emits candidates into the existing contract.
+- Real notification posting, messaging, and calling adapters remain intentionally unavailable until a privileged platform producer and user permission flow exist.
+- Computer-use control still needs richer UI-state observation beyond foreground package evidence.
 - AOSP/system-image testing is not connected yet. The next AOSP slice should make a real privileged foreground observer produce the first platform event currently supplied by a probe ingest file.
 - The escape-analysis matrix is initially scored from rooted-stock evidence and contract assumptions. It needs real AOSP/system-service evidence before we make a durable platform commitment.
