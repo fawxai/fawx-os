@@ -8,15 +8,16 @@ use fawx_agent_loop::{
     AgentLoop, BackgroundObservation, BackgroundRunner, BackgroundTickRequest, LoopStepRequest,
 };
 use fawx_android_adapter::{
-    AndroidEvent, AndroidForegroundUnavailableReason, AndroidObservation, AndroidSubstrate,
+    AndroidActionRequest, AndroidCommand, AndroidEvent, AndroidForegroundUnavailableReason,
+    AndroidObservation, AndroidSubstrate, CommandOutput, execute_android_action_request,
     foreground_observation,
 };
 use fawx_harness::{
     ForegroundPolicyDecision, ForegroundUnavailableReason, ModelActionKind, ModelActionProposal,
     ModelActivityKind, ModelActivityProposal, RuntimeEvent, RuntimeObservation,
     RuntimeObservationSource, TaskState, TaskTransitionError, apply_foreground_policy,
-    begin_current_action_execution, record_action_checkpoint, require_foreground_attention,
-    satisfy_human_handoff,
+    begin_current_action_execution, fail_current_action_execution, record_action_checkpoint,
+    require_foreground_attention, satisfy_human_handoff,
 };
 use fawx_kernel::{
     ActionBoundary, ActionBoundaryState, AgentActionStatus, AgentActivityTarget,
@@ -111,6 +112,10 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             let task_id = required_arg(&args, 1, "task id")?;
             let task = store.transition_state(task_id, begin_current_action_execution)?;
             print_task(&task)?;
+        }
+        "execute-action" => {
+            let task_id = required_arg(&args, 1, "task id")?;
+            run_execute_action(&store, task_id)?;
         }
         "heartbeat" => {
             let task_id = required_arg(&args, 1, "task id")?;
@@ -313,6 +318,144 @@ impl AgentStepOptions {
             model_action,
         })
     }
+}
+
+fn run_execute_action(store: &TaskStore, task_id: &str) -> Result<(), Box<dyn Error>> {
+    let current = store.load(task_id)?;
+    let request = android_request_for_current_action(&current.state)?;
+    let begun = store.transition_state(task_id, begin_current_action_execution)?;
+    let execution = match execute_android_action_request(&request) {
+        Ok(execution) => execution,
+        Err(error) => {
+            let failed_task = record_runtime_action_failure(store, task_id, &request, error)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "task": failed_task,
+                    "execution": {
+                        "success": false,
+                    },
+                }))?
+            );
+            return Err("android action execution failed before command launch".into());
+        }
+    };
+    if !execution.success {
+        let failed_task = record_runtime_action_failure(
+            store,
+            task_id,
+            &request,
+            command_output_summary(&execution),
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "task": failed_task,
+                "execution": command_output_value(&execution),
+            }))?
+        );
+        return Err(format!(
+            "android action execution failed: {}",
+            command_output_summary(&execution)
+        )
+        .into());
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task": begun,
+            "execution": command_output_value(&execution),
+        }))?
+    );
+    Ok(())
+}
+
+fn record_runtime_action_failure(
+    store: &TaskStore,
+    task_id: &str,
+    request: &AndroidActionRequest,
+    reason: String,
+) -> Result<StoredTask, Box<dyn Error>> {
+    let observation = RuntimeObservation {
+        source: RuntimeObservationSource::Android {
+            substrate: format!("{:?}", request.substrate),
+        },
+        event: RuntimeEvent::RuntimeActionFailed {
+            action: android_command_label(&request.command).to_string(),
+            reason,
+        },
+    };
+    Ok(store.transition_state(task_id, |state| {
+        fail_current_action_execution(state, observation)
+    })?)
+}
+
+fn android_request_for_current_action(state: &TaskState) -> Result<AndroidActionRequest, String> {
+    let Some(action) = state.current_action.as_ref() else {
+        return Err(format!(
+            "task {} has no current action to execute",
+            state.task_id
+        ));
+    };
+    match (&action.kind, &action.target) {
+        (
+            fawx_kernel::AgentActionKind::OpenApp,
+            Some(AgentActivityTarget::AndroidPackage { package_name }),
+        ) => {
+            validate_android_package_target(package_name)?;
+            Ok(AndroidActionRequest {
+                substrate: AndroidSubstrate::ReconRootedStock,
+                command: AndroidCommand::ResumeAppSurface {
+                    package_name: package_name.clone(),
+                },
+            })
+        }
+        (kind, target) => Err(format!(
+            "current action {kind:?} with target {target:?} has no rooted-stock executor"
+        )),
+    }
+}
+
+fn validate_android_package_target(package_name: &str) -> Result<(), String> {
+    if package_name.trim().is_empty() {
+        return Err("Android package target must not be empty".to_string());
+    }
+    if package_name.trim() != package_name {
+        return Err("Android package target must not contain surrounding whitespace".to_string());
+    }
+    Ok(())
+}
+
+fn android_command_label(command: &AndroidCommand) -> &'static str {
+    match command {
+        AndroidCommand::AcquireForeground { .. } => "acquire-foreground",
+        AndroidCommand::ReleaseForeground => "release-foreground",
+        AndroidCommand::ObserveNotifications { .. } => "observe-notifications",
+        AndroidCommand::QueryForegroundState => "query-foreground-state",
+        AndroidCommand::ResumeAppSurface { .. } => "resume-app-surface",
+        AndroidCommand::PerformRootedAction { .. } => "perform-rooted-action",
+    }
+}
+
+fn command_output_summary(output: &CommandOutput) -> String {
+    let stderr = output.stderr.trim();
+    let stdout = output.stdout.trim();
+    match (stderr.is_empty(), stdout.is_empty()) {
+        (false, false) => format!("{}; stderr={stderr}; stdout={stdout}", output.status),
+        (false, true) => format!("{}; stderr={stderr}", output.status),
+        (true, false) => format!("{}; stdout={stdout}", output.status),
+        (true, true) => output.status.clone(),
+    }
+}
+
+fn command_output_value(output: &CommandOutput) -> serde_json::Value {
+    serde_json::json!({
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+        "status": output.status,
+        "success": output.success,
+    })
 }
 
 fn run_agent_step(
@@ -844,6 +987,7 @@ fn print_usage() {
         "  fawx-terminal-runner background-tick [count] [interval-ms] [--foreground] [--foreground-task <task-id>]"
     );
     eprintln!("  fawx-terminal-runner begin-action <task-id>");
+    eprintln!("  fawx-terminal-runner execute-action <task-id>");
     eprintln!("  fawx-terminal-runner heartbeat <task-id> [count] [interval-ms] [--foreground]");
     eprintln!(
         "  fawx-terminal-runner watch-foreground <task-id> <expected-package> [count] [interval-ms]"
@@ -1139,6 +1283,59 @@ mod tests {
             Some(AgentActivityTarget::AndroidPackage { package_name })
                 if package_name == "com.android.settings"
         ));
+    }
+
+    #[test]
+    fn current_open_app_action_maps_to_typed_android_resume_request() {
+        let store = test_store();
+        create_open_app_action(&store, "task-settings", "com.android.settings", false);
+        let task = store.load("task-settings").expect("load task");
+
+        let request =
+            android_request_for_current_action(&task.state).expect("android execution request");
+
+        assert_eq!(request.substrate, AndroidSubstrate::ReconRootedStock);
+        assert_eq!(
+            request.command,
+            AndroidCommand::ResumeAppSurface {
+                package_name: "com.android.settings".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn current_action_request_rejects_task_without_action() {
+        let state = TaskState::new_background_task("task-empty", "no action");
+
+        let error = android_request_for_current_action(&state).expect_err("no action rejected");
+
+        assert!(error.contains("no current action"));
+    }
+
+    #[test]
+    fn current_action_request_rejects_noncanonical_android_package() {
+        let store = test_store();
+        create_open_app_action(&store, "task-settings", " com.android.settings", false);
+        let task = store.load("task-settings").expect("load task");
+
+        let error = android_request_for_current_action(&task.state)
+            .expect_err("noncanonical package rejected");
+
+        assert!(error.contains("surrounding whitespace"));
+    }
+
+    #[test]
+    fn command_output_summary_keeps_status_and_streams() {
+        let summary = command_output_summary(&CommandOutput {
+            stdout: "stdout text\n".to_string(),
+            stderr: "stderr text\n".to_string(),
+            status: "exit status: 1".to_string(),
+            success: false,
+        });
+
+        assert!(summary.contains("exit status: 1"));
+        assert!(summary.contains("stderr text"));
+        assert!(summary.contains("stdout text"));
     }
 
     #[test]
