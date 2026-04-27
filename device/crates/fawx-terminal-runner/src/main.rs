@@ -1,8 +1,9 @@
 use std::env;
 use std::error::Error;
+use std::io::{self, Write};
 use std::process::ExitCode;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fawx_agent_loop::{
     AgentLoop, BackgroundObservation, BackgroundRunner, BackgroundTickRequest, LoopStepRequest,
@@ -117,6 +118,9 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             let task_id = required_arg(&args, 1, "task id")?;
             run_execute_action(&store, task_id)?;
         }
+        "session" => {
+            run_terminal_session(&store)?;
+        }
         "heartbeat" => {
             let task_id = required_arg(&args, 1, "task id")?;
             let count = optional_usize(&args, 2, 5)?;
@@ -163,6 +167,27 @@ struct BackgroundTickOptions {
     interval: Duration,
     sample_foreground: bool,
     foreground_task: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalSessionCommand {
+    OpenApp { label: String, package_name: String },
+    Help,
+    List,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalSessionIntentSource {
+    /// Direct owner input parsed by the session shell. This may mint scoped
+    /// grants for the exact command target because the user is the authority.
+    OwnerCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalSessionIntent {
+    source: TerminalSessionIntentSource,
+    command: TerminalSessionCommand,
 }
 
 impl BackgroundTickOptions {
@@ -320,24 +345,379 @@ impl AgentStepOptions {
     }
 }
 
+fn run_terminal_session(store: &TaskStore) -> Result<(), Box<dyn Error>> {
+    println!("Fawx OS terminal session");
+    println!(
+        "Local model: not connected yet. This session uses deterministic typed intent parsing."
+    );
+    println!("Try: open settings, open launcher, open package <android.package>, list, help, quit");
+
+    let mut turn_index = 0_u64;
+    loop {
+        print!("fawx› ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input)? == 0 {
+            println!();
+            return Ok(());
+        }
+        if input.trim().is_empty() {
+            continue;
+        }
+
+        match parse_terminal_session_intent(&input) {
+            Ok(TerminalSessionIntent {
+                source,
+                command:
+                    TerminalSessionCommand::OpenApp {
+                        label,
+                        package_name,
+                    },
+            }) => {
+                turn_index += 1;
+                if let Err(error) =
+                    run_session_open_app(store, turn_index, source, &label, &package_name)
+                {
+                    println!("blocked: {error}");
+                }
+            }
+            Ok(TerminalSessionIntent {
+                command: TerminalSessionCommand::Help,
+                ..
+            }) => print_terminal_session_help(),
+            Ok(TerminalSessionIntent {
+                command: TerminalSessionCommand::List,
+                ..
+            }) => print_session_task_list(store)?,
+            Ok(TerminalSessionIntent {
+                command: TerminalSessionCommand::Quit,
+                ..
+            }) => return Ok(()),
+            Err(error) => {
+                println!("{error}");
+                print_terminal_session_help();
+            }
+        }
+    }
+}
+
+fn run_session_open_app(
+    store: &TaskStore,
+    turn_index: u64,
+    source: TerminalSessionIntentSource,
+    label: &str,
+    package_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    let task_id = session_task_id(turn_index)?;
+    let objective = format!("open {label}");
+    store.create(TaskState::new_background_task(&task_id, objective))?;
+    grant_session_app_control(store, &task_id, source, package_name)?;
+
+    let accepted = AgentLoop::new(store.clone()).step(LoopStepRequest {
+        task_id: task_id.clone(),
+        observations: vec![],
+        expected_foreground_package: None,
+        model_activity: Some(ModelActivityProposal {
+            kind: ModelActivityKind::Planning,
+            target: Some(AgentActivityTarget::AndroidPackage {
+                package_name: package_name.to_string(),
+            }),
+            description: format!("Opening {label} through the Android runtime adapter."),
+        }),
+        model_action: Some(ModelActionProposal {
+            kind: ModelActionKind::OpenApp,
+            target: Some(AgentActivityTarget::AndroidPackage {
+                package_name: package_name.to_string(),
+            }),
+            reason: format!("open {label}"),
+            expected_observation: Some(format!("{label} is foreground")),
+            proposal_id: None,
+        }),
+    })?;
+
+    println!(
+        "accepted: {}",
+        describe_current_action_status(&accepted.task.state)
+    );
+    let execution = execute_action(store, &task_id)?;
+    println!(
+        "executed: {}",
+        if execution.execution.success {
+            "runtime launch command succeeded"
+        } else {
+            "runtime launch command failed"
+        }
+    );
+
+    let task = poll_session_foreground_until_closed(
+        store,
+        &task_id,
+        turn_index,
+        10,
+        Duration::from_millis(250),
+        || foreground_observation(AndroidSubstrate::ReconRootedStock),
+        thread::sleep,
+    )?;
+
+    match task
+        .state
+        .current_action
+        .as_ref()
+        .map(|action| action.status)
+    {
+        Some(AgentActionStatus::Observed) => {
+            println!("done: {label} is foreground");
+        }
+        Some(status) => {
+            println!("waiting: action is {status:?}; foreground did not settle before timeout");
+        }
+        None => {
+            println!("waiting: task has no current action after execution");
+        }
+    }
+    Ok(())
+}
+
+fn grant_session_app_control(
+    store: &TaskStore,
+    task_id: &str,
+    source: TerminalSessionIntentSource,
+    package_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    match source {
+        TerminalSessionIntentSource::OwnerCommand => {
+            store.transition_state(task_id, |mut state| {
+                state.contract.safety_grants.push(SafetyGrant::scoped(
+                    SafetyCapability::AppControl,
+                    SafetyScope::AndroidPackage {
+                        package_name: package_name.to_string(),
+                    },
+                ));
+                Ok::<_, TaskTransitionError>(state)
+            })?;
+            Ok(())
+        }
+    }
+}
+
+fn poll_session_foreground_until_closed(
+    store: &TaskStore,
+    task_id: &str,
+    turn_index: u64,
+    max_attempts: usize,
+    interval: Duration,
+    mut observe: impl FnMut() -> AndroidObservation,
+    mut sleep: impl FnMut(Duration),
+) -> Result<StoredTask, Box<dyn Error>> {
+    let attempts = max_attempts.max(1);
+    let expected_package = expected_session_foreground_package(&store.load(task_id)?.state);
+    for attempt in 1..=attempts {
+        let android_observation = observe();
+        if attempt < attempts
+            && let Some(expected_package) = expected_package.as_deref()
+            && foreground_package_from_android_observation(&android_observation)
+                .is_some_and(|observed| observed != expected_package)
+        {
+            sleep(interval);
+            continue;
+        }
+        let observations =
+            scoped_foreground_observations(&store.list()?, &android_observation, Some(task_id))?;
+        BackgroundRunner::new(store.clone()).tick(BackgroundTickRequest {
+            tick_id: turn_index + attempt as u64 - 1,
+            observations,
+        })?;
+        let task = store.load(task_id)?;
+        if session_action_is_closed(&task.state) || attempt == attempts {
+            return Ok(task);
+        }
+        sleep(interval);
+    }
+
+    store.load(task_id).map_err(Into::into)
+}
+
+fn expected_session_foreground_package(state: &TaskState) -> Option<String> {
+    match state
+        .current_action
+        .as_ref()
+        .and_then(|action| action.target.as_ref())
+    {
+        Some(AgentActivityTarget::AndroidPackage { package_name }) => Some(package_name.clone()),
+        _ => None,
+    }
+}
+
+fn foreground_package_from_android_observation(observation: &AndroidObservation) -> Option<&str> {
+    match &observation.event {
+        AndroidEvent::ForegroundAppChanged { package_name, .. } => Some(package_name),
+        _ => None,
+    }
+}
+
+fn session_action_is_closed(state: &TaskState) -> bool {
+    state.current_action.as_ref().is_some_and(|action| {
+        matches!(
+            action.status,
+            AgentActionStatus::Observed | AgentActionStatus::Verified | AgentActionStatus::Failed
+        )
+    })
+}
+
+fn parse_terminal_session_intent(input: &str) -> Result<TerminalSessionIntent, String> {
+    Ok(TerminalSessionIntent {
+        source: TerminalSessionIntentSource::OwnerCommand,
+        command: parse_terminal_session_command(input)?,
+    })
+}
+
+fn parse_terminal_session_command(input: &str) -> Result<TerminalSessionCommand, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("empty prompt".to_string());
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    match normalized.as_str() {
+        "quit" | "exit" | ":q" => return Ok(TerminalSessionCommand::Quit),
+        "help" | "?" => return Ok(TerminalSessionCommand::Help),
+        "list" | "tasks" | "status" => return Ok(TerminalSessionCommand::List),
+        "open settings" | "launch settings" => {
+            return Ok(open_app_command("Settings", "com.android.settings"));
+        }
+        "open launcher" | "launch launcher" | "go home" | "home" => {
+            return Ok(open_app_command(
+                "Launcher",
+                "com.google.android.apps.nexuslauncher",
+            ));
+        }
+        _ => {}
+    }
+
+    for prefix in [
+        "open package ",
+        "launch package ",
+        "open app ",
+        "launch app ",
+    ] {
+        if normalized.starts_with(prefix) {
+            let package_name = &trimmed[prefix.len()..];
+            return parse_open_package(package_name);
+        }
+    }
+    for prefix in ["open ", "launch "] {
+        if normalized.starts_with(prefix)
+            && let Some(package_name) = trimmed.get(prefix.len()..)
+            && package_name.contains('.')
+        {
+            return parse_open_package(package_name);
+        }
+    }
+
+    Err(format!("unsupported prompt: {trimmed}"))
+}
+
+fn parse_open_package(package_name: &str) -> Result<TerminalSessionCommand, String> {
+    validate_android_package_target(package_name)?;
+    Ok(open_app_command(package_name, package_name))
+}
+
+fn open_app_command(label: &str, package_name: &str) -> TerminalSessionCommand {
+    TerminalSessionCommand::OpenApp {
+        label: label.to_string(),
+        package_name: package_name.to_string(),
+    }
+}
+
+fn print_terminal_session_help() {
+    println!("supported prompts:");
+    println!("  open settings");
+    println!("  open launcher");
+    println!("  open package <android.package>");
+    println!("  list");
+    println!("  quit");
+}
+
+fn print_session_task_list(store: &TaskStore) -> Result<(), Box<dyn Error>> {
+    let tasks = store.list()?;
+    if tasks.is_empty() {
+        println!("no tasks");
+        return Ok(());
+    }
+    for task in tasks {
+        println!(
+            "{}\t{:?}\t{}",
+            task.state.task_id, task.state.phase, task.state.contract.user_intent
+        );
+    }
+    Ok(())
+}
+
+fn session_task_id(turn_index: u64) -> Result<String, Box<dyn Error>> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    Ok(format!(
+        "session-{}-{}-{}",
+        std::process::id(),
+        now,
+        turn_index
+    ))
+}
+
+fn describe_current_action_status(state: &TaskState) -> String {
+    match state.current_action.as_ref() {
+        Some(action) => format!("{:?} {:?}", action.kind, action.status),
+        None => "no current action".to_string(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ActionExecutionResult {
+    task: StoredTask,
+    execution: CommandOutput,
+}
+
 fn run_execute_action(store: &TaskStore, task_id: &str) -> Result<(), Box<dyn Error>> {
+    let result = execute_action(store, task_id)?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task": result.task,
+            "execution": command_output_value(&result.execution),
+        }))?
+    );
+    if !result.execution.success {
+        return Err(format!(
+            "android action execution failed: {}",
+            command_output_summary(&result.execution)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn execute_action(
+    store: &TaskStore,
+    task_id: &str,
+) -> Result<ActionExecutionResult, Box<dyn Error>> {
     let current = store.load(task_id)?;
     let request = android_request_for_current_action(&current.state)?;
     let begun = store.transition_state(task_id, begin_current_action_execution)?;
     let execution = match execute_android_action_request(&request) {
         Ok(execution) => execution,
         Err(error) => {
-            let failed_task = record_runtime_action_failure(store, task_id, &request, error)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "task": failed_task,
-                    "execution": {
-                        "success": false,
-                    },
-                }))?
-            );
-            return Err("android action execution failed before command launch".into());
+            let failed_task =
+                record_runtime_action_failure(store, task_id, &request, error.clone())?;
+            return Ok(ActionExecutionResult {
+                task: failed_task,
+                execution: CommandOutput {
+                    stdout: String::new(),
+                    stderr: error,
+                    status: "adapter error".to_string(),
+                    success: false,
+                },
+            });
         }
     };
     if !execution.success {
@@ -347,28 +727,16 @@ fn run_execute_action(store: &TaskStore, task_id: &str) -> Result<(), Box<dyn Er
             &request,
             command_output_summary(&execution),
         )?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "task": failed_task,
-                "execution": command_output_value(&execution),
-            }))?
-        );
-        return Err(format!(
-            "android action execution failed: {}",
-            command_output_summary(&execution)
-        )
-        .into());
+        return Ok(ActionExecutionResult {
+            task: failed_task,
+            execution,
+        });
     }
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "task": begun,
-            "execution": command_output_value(&execution),
-        }))?
-    );
-    Ok(())
+    Ok(ActionExecutionResult {
+        task: begun,
+        execution,
+    })
 }
 
 fn record_runtime_action_failure(
@@ -988,6 +1356,7 @@ fn print_usage() {
     );
     eprintln!("  fawx-terminal-runner begin-action <task-id>");
     eprintln!("  fawx-terminal-runner execute-action <task-id>");
+    eprintln!("  fawx-terminal-runner session");
     eprintln!("  fawx-terminal-runner heartbeat <task-id> [count] [interval-ms] [--foreground]");
     eprintln!(
         "  fawx-terminal-runner watch-foreground <task-id> <expected-package> [count] [interval-ms]"
@@ -1322,6 +1691,105 @@ mod tests {
             .expect_err("noncanonical package rejected");
 
         assert!(error.contains("surrounding whitespace"));
+    }
+
+    #[test]
+    fn terminal_session_parser_supports_open_settings() {
+        let command = parse_terminal_session_command("open settings").expect("parse prompt");
+
+        assert_eq!(
+            command,
+            TerminalSessionCommand::OpenApp {
+                label: "Settings".to_string(),
+                package_name: "com.android.settings".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_session_intent_marks_owner_command_authority() {
+        let intent = parse_terminal_session_intent("open settings").expect("parse intent");
+
+        assert_eq!(intent.source, TerminalSessionIntentSource::OwnerCommand);
+        assert!(matches!(
+            intent.command,
+            TerminalSessionCommand::OpenApp { package_name, .. }
+                if package_name == "com.android.settings"
+        ));
+    }
+
+    #[test]
+    fn terminal_session_parser_supports_package_targets() {
+        let command =
+            parse_terminal_session_command("open package com.android.settings").expect("parse");
+
+        assert_eq!(
+            command,
+            TerminalSessionCommand::OpenApp {
+                label: "com.android.settings".to_string(),
+                package_name: "com.android.settings".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_session_parser_supports_case_insensitive_verbs() {
+        let command = parse_terminal_session_command("Open Package com.android.settings")
+            .expect("case-insensitive parse");
+
+        assert_eq!(
+            command,
+            TerminalSessionCommand::OpenApp {
+                label: "com.android.settings".to_string(),
+                package_name: "com.android.settings".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_session_parser_rejects_unsupported_prompts() {
+        let error =
+            parse_terminal_session_command("send a message").expect_err("unsupported prompt");
+
+        assert!(error.contains("unsupported prompt"));
+    }
+
+    #[test]
+    fn terminal_session_task_ids_are_store_safe() {
+        let task_id = session_task_id(1).expect("task id");
+
+        assert!(
+            task_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        );
+    }
+
+    #[test]
+    fn terminal_session_foreground_polling_waits_until_action_observed() {
+        let store = test_store();
+        create_open_app_action(&store, "task-settings", "com.android.settings", true);
+        let mut observations = vec![
+            foreground("com.google.android.apps.nexuslauncher"),
+            foreground("com.android.settings"),
+        ]
+        .into_iter();
+        let mut sleep_count = 0;
+
+        let task = poll_session_foreground_until_closed(
+            &store,
+            "task-settings",
+            1,
+            3,
+            Duration::from_millis(1),
+            || observations.next().expect("foreground observation"),
+            |_| sleep_count += 1,
+        )
+        .expect("poll foreground");
+
+        let action = task.state.current_action.expect("current action");
+        assert_eq!(action.status, AgentActionStatus::Observed);
+        assert_eq!(sleep_count, 1);
     }
 
     #[test]

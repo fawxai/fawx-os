@@ -63,14 +63,19 @@ Start here:
 - [/Users/joseph/fawx-os/docs/architecture/android-boundary.md](/Users/joseph/fawx-os/docs/architecture/android-boundary.md)
 - [/Users/joseph/fawx-os/docs/specs/background-task-lifecycle.md](/Users/joseph/fawx-os/docs/specs/background-task-lifecycle.md)
 - [/Users/joseph/fawx-os/docs/specs/pixel-terminal-recon.md](/Users/joseph/fawx-os/docs/specs/pixel-terminal-recon.md)
+- [/Users/joseph/fawx-os/docs/specs/terminal-agent-session.md](/Users/joseph/fawx-os/docs/specs/terminal-agent-session.md)
 
 ## Current Status
 
 This repo is in the founding architecture phase. The current proven vertical
-slice is stock ADB-shell reconnaissance: Rust binaries can be built for Android,
-pushed with ADB, observe foreground state, and persist typed task checkpoints.
-Rooted runtime and AOSP-level control remain adapter targets, not capabilities
-this repo has proven end-to-end yet.
+slice is rooted-stock Android reconnaissance: Rust binaries can be built for
+Android, pushed with ADB, observe foreground state, persist typed task
+checkpoints, execute app-control through the runtime adapter, and close actions
+from typed foreground evidence.
+
+The interactive terminal session is deterministic for now. It does not call a
+local model yet; it exercises the same typed contracts that a local model will
+eventually feed.
 
 The next step is to grow that slice into:
 

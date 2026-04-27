@@ -80,6 +80,33 @@ The system should prefer:
 
 The default successful response is not "here's how to do it." It is "done."
 
+## The Three-Layer Interface
+
+The product should converge on three interface layers:
+
+1. Ambient intent capture.
+2. Agentic execution.
+3. Ephemeral verification UX.
+
+Ambient intent capture means the system can use typed, permissioned context to
+understand what the user may be trying to do: voice, text, foreground app,
+screen state, location, calendar, messages, notifications, habits, and other
+local signals. This layer should produce intent candidates and context records,
+not uncontrolled side effects.
+
+Agentic execution is the real work layer. Agents use device actions, browser
+automation, APIs, documents, email, calendar, payments, messaging, support
+systems, and cloud escalation as implementation surfaces. Most "computer use"
+should become machine-to-machine clerical labor below the user's attention.
+
+Ephemeral verification UX is where conventional UI survives. The user still
+needs to inspect, compare, approve, edit, reject, or enjoy outputs. Those
+surfaces should be disposable, task-specific verification panels rather than
+permanent app destinations.
+
+In short: capture intent broadly, execute through typed agents, verify through
+temporary UI.
+
 ## Background Operation
 
 The agent must be able to work while the user continues using the phone.
