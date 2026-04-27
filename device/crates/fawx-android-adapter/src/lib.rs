@@ -281,6 +281,11 @@ pub enum AndroidEvent {
         reason: AndroidAppLaunchUnavailableReason,
         raw_source: Option<String>,
     },
+    NotificationUnavailable {
+        target: String,
+        reason: AndroidNotificationUnavailableReason,
+        raw_source: Option<String>,
+    },
     TargetSurfaceBecameUnavailable {
         target: String,
     },
@@ -315,6 +320,11 @@ pub enum AndroidBackgroundSupervisorUnavailableReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AndroidAppLaunchUnavailableReason {
+    AdapterUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AndroidNotificationUnavailableReason {
     AdapterUnavailable,
 }
 
@@ -417,9 +427,21 @@ impl<'de> Deserialize<'de> for AndroidObservation {
                     validate_aosp_platform_event_source(source, AOSP_APP_CONTROLLER_SERVICE)
                         .map_err(serde::de::Error::custom)?;
                 }
+                AndroidEvent::NotificationReceived { .. } => {
+                    let Some(AndroidObservationProvenance::AospPlatformEvent { source }) =
+                        wire.provenance.as_ref()
+                    else {
+                        return Err(serde::de::Error::custom(
+                            "AospPlatform notification observations require AospPlatformEvent provenance",
+                        ));
+                    };
+                    validate_aosp_platform_event_source(source, AOSP_NOTIFICATION_LISTENER_SERVICE)
+                        .map_err(serde::de::Error::custom)?;
+                }
                 AndroidEvent::ForegroundObservationUnavailable { .. }
                 | AndroidEvent::BackgroundSupervisorUnavailable { .. }
                 | AndroidEvent::AppLaunchUnavailable { .. }
+                | AndroidEvent::NotificationUnavailable { .. }
                     if matches!(
                         wire.provenance,
                         Some(AndroidObservationProvenance::AospPlatformEvent { .. })
@@ -460,6 +482,7 @@ pub struct AospPlatformEventSource {
 pub const AOSP_FOREGROUND_OBSERVER_SERVICE: &str = "fawx-system-foreground-observer";
 pub const AOSP_BACKGROUND_SUPERVISOR_SERVICE: &str = "fawx-system-background-supervisor";
 pub const AOSP_APP_CONTROLLER_SERVICE: &str = "fawx-system-app-controller";
+pub const AOSP_NOTIFICATION_LISTENER_SERVICE: &str = "fawx-system-notification-listener";
 
 /// Foreground state emitted by a real AOSP/system adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,6 +505,14 @@ pub struct AospBackgroundSupervisorEvent {
 pub struct AospAppLaunchResult {
     pub package_name: String,
     pub activity_name: Option<String>,
+    pub source: AospPlatformEventSource,
+}
+
+/// Notification event emitted by a real AOSP/system notification listener.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AospNotificationEvent {
+    pub app_package_name: String,
+    pub summary: String,
     pub source: AospPlatformEventSource,
 }
 
@@ -846,6 +877,21 @@ pub fn aosp_app_launch_unavailable_observation(target: &str) -> AndroidObservati
     }
 }
 
+pub fn aosp_notification_unavailable_observation(target: &str) -> AndroidObservation {
+    AndroidObservation {
+        substrate: AndroidSubstrate::AospPlatform,
+        event: AndroidEvent::NotificationUnavailable {
+            target: target.to_string(),
+            reason: AndroidNotificationUnavailableReason::AdapterUnavailable,
+            raw_source: Some(
+                "AOSP notification listener is not connected; notification reads must come from a platform listener"
+                    .to_string(),
+            ),
+        },
+        provenance: None,
+    }
+}
+
 pub fn aosp_foreground_observation_from_platform_event(
     event: AospForegroundEvent,
 ) -> Result<AndroidObservation, String> {
@@ -943,6 +989,38 @@ fn validate_aosp_app_launch_result(result: &AospAppLaunchResult) -> Result<(), S
         validate_no_surrounding_whitespace("AOSP app launch activity", activity_name)?;
     }
     validate_aosp_platform_event_source(&result.source, AOSP_APP_CONTROLLER_SERVICE)?;
+    Ok(())
+}
+
+pub fn aosp_notification_observation_from_platform_event(
+    event: AospNotificationEvent,
+) -> Result<AndroidObservation, String> {
+    validate_aosp_notification_event(&event)?;
+    let source = event.source.clone();
+    Ok(AndroidObservation {
+        substrate: AndroidSubstrate::AospPlatform,
+        event: AndroidEvent::NotificationReceived {
+            source: event.app_package_name,
+            summary: event.summary,
+        },
+        provenance: Some(AndroidObservationProvenance::AospPlatformEvent { source }),
+    })
+}
+
+pub fn aosp_notification_observation_from_platform_event_json(
+    event_json: &str,
+) -> Result<AndroidObservation, String> {
+    let event = serde_json::from_str::<AospNotificationEvent>(event_json)
+        .map_err(|error| format!("failed to decode AOSP notification event: {error}"))?;
+    aosp_notification_observation_from_platform_event(event)
+}
+
+fn validate_aosp_notification_event(event: &AospNotificationEvent) -> Result<(), String> {
+    validate_nonempty_token("AOSP notification app package", &event.app_package_name)?;
+    validate_no_surrounding_whitespace("AOSP notification app package", &event.app_package_name)?;
+    validate_nonempty_token("AOSP notification summary", &event.summary)?;
+    validate_no_surrounding_whitespace("AOSP notification summary", &event.summary)?;
+    validate_aosp_platform_event_source(&event.source, AOSP_NOTIFICATION_LISTENER_SERVICE)?;
     Ok(())
 }
 
@@ -1996,6 +2074,81 @@ mod tests {
     }
 
     #[test]
+    fn aosp_notification_event_converts_with_provenance() {
+        let observation =
+            aosp_notification_observation_from_platform_event(AospNotificationEvent {
+                app_package_name: "com.example.mail".to_string(),
+                summary: "New message from Ada".to_string(),
+                source: AospPlatformEventSource {
+                    service_name: AOSP_NOTIFICATION_LISTENER_SERVICE.to_string(),
+                    event_id: "event-1".to_string(),
+                },
+            })
+            .expect("notification event should convert");
+
+        assert_eq!(observation.substrate, AndroidSubstrate::AospPlatform);
+        assert_eq!(
+            observation.event,
+            AndroidEvent::NotificationReceived {
+                source: "com.example.mail".to_string(),
+                summary: "New message from Ada".to_string(),
+            }
+        );
+        assert_eq!(
+            observation.provenance,
+            Some(AndroidObservationProvenance::AospPlatformEvent {
+                source: AospPlatformEventSource {
+                    service_name: AOSP_NOTIFICATION_LISTENER_SERVICE.to_string(),
+                    event_id: "event-1".to_string(),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn aosp_notification_event_rejects_recon_sources() {
+        let error = aosp_notification_observation_from_platform_event(AospNotificationEvent {
+            app_package_name: "com.example.mail".to_string(),
+            summary: "New message from Ada".to_string(),
+            source: AospPlatformEventSource {
+                service_name: "dumpsys".to_string(),
+                event_id: "event-1".to_string(),
+            },
+        })
+        .expect_err("dumpsys source should reject");
+
+        assert!(error.contains(AOSP_NOTIFICATION_LISTENER_SERVICE));
+    }
+
+    #[test]
+    fn aosp_notification_event_json_decodes_to_platform_observation() {
+        let observation = aosp_notification_observation_from_platform_event_json(
+            r#"{
+                "app_package_name": "com.example.mail",
+                "summary": "New message from Ada",
+                "source": {
+                    "service_name": "fawx-system-notification-listener",
+                    "event_id": "event-123"
+                }
+            }"#,
+        )
+        .expect("valid notification event json should produce observation");
+
+        assert_eq!(observation.substrate, AndroidSubstrate::AospPlatform);
+        assert!(matches!(
+            observation.event,
+            AndroidEvent::NotificationReceived { source, summary }
+                if source == "com.example.mail" && summary == "New message from Ada"
+        ));
+        assert!(matches!(
+            observation.provenance,
+            Some(AndroidObservationProvenance::AospPlatformEvent { source })
+                if source.service_name == AOSP_NOTIFICATION_LISTENER_SERVICE
+                    && source.event_id == "event-123"
+        ));
+    }
+
+    #[test]
     fn android_observation_deserialization_rejects_forged_aosp_foreground_success() {
         let json = serde_json::json!({
             "substrate": "AospPlatform",
@@ -2167,6 +2320,54 @@ mod tests {
         assert!(matches!(
             observation.event,
             AndroidEvent::AppLaunchCompleted { .. }
+        ));
+    }
+
+    #[test]
+    fn android_observation_deserialization_requires_notification_provenance() {
+        let json = serde_json::json!({
+            "substrate": "AospPlatform",
+            "event": {
+                "NotificationReceived": {
+                    "source": "com.example.mail",
+                    "summary": "New message from Ada"
+                }
+            }
+        });
+
+        let error =
+            serde_json::from_value::<AndroidObservation>(json).expect_err("forged AOSP rejected");
+
+        assert!(error.to_string().contains("provenance"));
+    }
+
+    #[test]
+    fn android_observation_deserialization_allows_notification_with_provenance() {
+        let json = serde_json::json!({
+            "substrate": "AospPlatform",
+            "event": {
+                "NotificationReceived": {
+                    "source": "com.example.mail",
+                    "summary": "New message from Ada"
+                }
+            },
+            "provenance": {
+                "AospPlatformEvent": {
+                    "source": {
+                        "service_name": AOSP_NOTIFICATION_LISTENER_SERVICE,
+                        "event_id": "event-1"
+                    }
+                }
+            }
+        });
+
+        let observation =
+            serde_json::from_value::<AndroidObservation>(json).expect("provenance is valid");
+
+        assert_eq!(observation.substrate, AndroidSubstrate::AospPlatform);
+        assert!(matches!(
+            observation.event,
+            AndroidEvent::NotificationReceived { .. }
         ));
     }
 

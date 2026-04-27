@@ -19,7 +19,7 @@ Capability                  Score  Exit Pressure  Current Evidence
 Foreground observation      1      Medium         typed foreground ingest seam; no real AOSP service producer yet
 App launch/resume           1      Medium         typed app-controller ingest seam; no real AOSP service producer yet
 Background execution        1      High           typed supervisor ingest seam; no real AOSP service producer yet
-Notification read           U      High           no adapter yet
+Notification read           1      High           typed notification ingest seam; no real AOSP service producer yet
 Notification post           U      Medium         requires AOSP privilege; no adapter yet
 Phone call                  U      High           no telephony adapter yet
 Messaging                   U      High           no messaging adapter yet
@@ -32,7 +32,7 @@ Next evidence gates:
 1. Connect AOSP foreground AdapterUnavailable to a real AospForegroundEvent.
 2. Connect AOSP app-launch AdapterUnavailable to a real app-controller result.
 3. Connect a real AOSP service to the background supervisor event seam.
-4. Bridge notifications as typed runtime events.
+4. Connect AOSP notification AdapterUnavailable to a real listener event.
 
 Decision gate:
 - Must-have primitives: background execution, foreground/window observation,

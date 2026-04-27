@@ -9,7 +9,9 @@ use fawx_android_adapter::{
     aosp_background_supervisor_observation_from_platform_event_json,
     aosp_background_supervisor_unavailable_observation,
     aosp_foreground_observation_from_platform_event_json,
-    aosp_platform_adapter_unavailable_observation, foreground_observation, run_recon_command,
+    aosp_notification_observation_from_platform_event_json,
+    aosp_notification_unavailable_observation, aosp_platform_adapter_unavailable_observation,
+    foreground_observation, run_recon_command,
 };
 use serde::Serialize;
 
@@ -27,7 +29,7 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "usage: fawx-android-probe [--substrate recon-rooted-stock|aosp-platform] [--aosp-foreground-event-file PATH] [--aosp-background-supervisor-event-file PATH] [--aosp-app-launch-result-file PATH]";
+const USAGE: &str = "usage: fawx-android-probe [--substrate recon-rooted-stock|aosp-platform] [--aosp-foreground-event-file PATH] [--aosp-background-supervisor-event-file PATH] [--aosp-app-launch-result-file PATH] [--aosp-notification-event-file PATH]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeExit {
@@ -42,6 +44,7 @@ enum ProbeArgs {
         aosp_foreground_event_file: Option<String>,
         aosp_background_supervisor_event_file: Option<String>,
         aosp_app_launch_result_file: Option<String>,
+        aosp_notification_event_file: Option<String>,
     },
     Help,
 }
@@ -52,6 +55,7 @@ fn run() -> Result<ProbeExit, Box<dyn Error>> {
         aosp_foreground_event_file,
         aosp_background_supervisor_event_file,
         aosp_app_launch_result_file,
+        aosp_notification_event_file,
     } = parse_probe_args(std::env::args().skip(1))?
     else {
         return Ok(ProbeExit::Help);
@@ -64,6 +68,7 @@ fn run() -> Result<ProbeExit, Box<dyn Error>> {
             aosp_foreground_event_file.as_deref(),
             aosp_background_supervisor_event_file.as_deref(),
             aosp_app_launch_result_file.as_deref(),
+            aosp_notification_event_file.as_deref(),
         ),
     };
 
@@ -79,6 +84,7 @@ where
     let mut aosp_foreground_event_file = None;
     let mut aosp_background_supervisor_event_file = None;
     let mut aosp_app_launch_result_file = None;
+    let mut aosp_notification_event_file = None;
     let mut args = args.peekable();
 
     while let Some(arg) = args.next() {
@@ -117,6 +123,15 @@ where
                 }
                 aosp_app_launch_result_file = Some(value);
             }
+            "--aosp-notification-event-file" => {
+                let value = args
+                    .next()
+                    .ok_or("missing value after --aosp-notification-event-file")?;
+                if value.starts_with("--") {
+                    return Err("missing value after --aosp-notification-event-file".into());
+                }
+                aosp_notification_event_file = Some(value);
+            }
             value if value.starts_with("--") => {
                 return Err(format!("unexpected probe option: {value}").into());
             }
@@ -128,7 +143,8 @@ where
 
     if (aosp_foreground_event_file.is_some()
         || aosp_background_supervisor_event_file.is_some()
-        || aosp_app_launch_result_file.is_some())
+        || aosp_app_launch_result_file.is_some()
+        || aosp_notification_event_file.is_some())
         && substrate != AndroidSubstrate::AospPlatform
     {
         return Err(
@@ -141,6 +157,7 @@ where
         aosp_foreground_event_file,
         aosp_background_supervisor_event_file,
         aosp_app_launch_result_file,
+        aosp_notification_event_file,
     })
 }
 
@@ -164,6 +181,7 @@ fn probe_observations(
     aosp_foreground_event_file: Option<&str>,
     aosp_background_supervisor_event_file: Option<&str>,
     aosp_app_launch_result_file: Option<&str>,
+    aosp_notification_event_file: Option<&str>,
 ) -> Vec<ProbeObservation> {
     match substrate {
         AndroidSubstrate::ReconRootedStock => vec![
@@ -182,6 +200,8 @@ fn probe_observations(
                 );
             let app_launch_result_observation =
                 aosp_app_launch_result_observation_from_file(aosp_app_launch_result_file);
+            let notification_event_observation =
+                aosp_notification_event_observation_from_file(aosp_notification_event_file);
             vec![
                 aosp_adapter_probe_observation(
                     aosp_foreground_event_file,
@@ -198,6 +218,11 @@ fn probe_observations(
                     &app_launch_result_observation,
                 ),
                 app_launch_probe_observation(app_launch_result_observation),
+                aosp_notification_listener_probe_observation(
+                    aosp_notification_event_file,
+                    &notification_event_observation,
+                ),
+                notification_probe_observation(notification_event_observation),
             ]
         }
     }
@@ -341,6 +366,13 @@ enum AospBackgroundSupervisorEventObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AospAppLaunchResultObservation {
+    Observed(AndroidObservation),
+    Invalid { reason: String },
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AospNotificationEventObservation {
     Observed(AndroidObservation),
     Invalid { reason: String },
     Unavailable,
@@ -607,6 +639,117 @@ fn app_launch_unavailable(
     }
 }
 
+fn aosp_notification_listener_probe_observation(
+    aosp_notification_event_file: Option<&str>,
+    event_observation: &AospNotificationEventObservation,
+) -> ProbeObservation {
+    match (aosp_notification_event_file, event_observation) {
+        (Some(path), AospNotificationEventObservation::Observed(_)) => ProbeObservation {
+            name: "aosp-notification-listener".to_string(),
+            ok: true,
+            summary: format!("AOSP notification event source connected: {path}"),
+            android_observation: None,
+        },
+        (Some(path), AospNotificationEventObservation::Invalid { reason }) => ProbeObservation {
+            name: "aosp-notification-listener".to_string(),
+            ok: false,
+            summary: format!("AOSP notification event source invalid: {path}: {reason}"),
+            android_observation: None,
+        },
+        (Some(path), AospNotificationEventObservation::Unavailable) => ProbeObservation {
+            name: "aosp-notification-listener".to_string(),
+            ok: false,
+            summary: format!("AOSP notification event source unavailable: {path}"),
+            android_observation: None,
+        },
+        (None, AospNotificationEventObservation::Unavailable) => ProbeObservation {
+            name: "aosp-notification-listener".to_string(),
+            ok: false,
+            summary: "AOSP notification listener is not connected in this terminal binary"
+                .to_string(),
+            android_observation: None,
+        },
+        (None, _) => ProbeObservation {
+            name: "aosp-notification-listener".to_string(),
+            ok: false,
+            summary: "AOSP notification listener state is inconsistent".to_string(),
+            android_observation: None,
+        },
+    }
+}
+
+fn notification_probe_observation(
+    event_observation: AospNotificationEventObservation,
+) -> ProbeObservation {
+    let observation = match event_observation {
+        AospNotificationEventObservation::Observed(observation) => observation,
+        AospNotificationEventObservation::Invalid { reason } => {
+            return notification_unavailable(format!("notification unavailable: {reason}"), None);
+        }
+        AospNotificationEventObservation::Unavailable => {
+            aosp_notification_unavailable_observation("notifications")
+        }
+    };
+
+    match observation.event().clone() {
+        AndroidEvent::NotificationReceived { source, summary } => ProbeObservation {
+            name: "notification".to_string(),
+            ok: true,
+            summary: format!("{source}: {summary}"),
+            android_observation: Some(observation),
+        },
+        AndroidEvent::NotificationUnavailable {
+            reason, raw_source, ..
+        } => notification_unavailable(
+            match raw_source {
+                Some(raw_source) if !raw_source.is_empty() => {
+                    format!("notification unavailable: {reason:?}; raw_source={raw_source}")
+                }
+                _ => format!("notification unavailable: {reason:?}"),
+            },
+            Some(observation),
+        ),
+        _ => notification_unavailable(
+            "unexpected notification observation".to_string(),
+            Some(observation),
+        ),
+    }
+}
+
+fn aosp_notification_event_observation_from_file(
+    aosp_notification_event_file: Option<&str>,
+) -> AospNotificationEventObservation {
+    let Some(path) = aosp_notification_event_file else {
+        return AospNotificationEventObservation::Unavailable;
+    };
+
+    let event_json = match fs::read_to_string(path) {
+        Ok(event_json) => event_json,
+        Err(error) => {
+            return AospNotificationEventObservation::Invalid {
+                reason: format!("failed to read {path}: {error}"),
+            };
+        }
+    };
+
+    match aosp_notification_observation_from_platform_event_json(&event_json) {
+        Ok(observation) => AospNotificationEventObservation::Observed(observation),
+        Err(error) => AospNotificationEventObservation::Invalid { reason: error },
+    }
+}
+
+fn notification_unavailable(
+    summary: String,
+    android_observation: Option<AndroidObservation>,
+) -> ProbeObservation {
+    ProbeObservation {
+        name: "notification".to_string(),
+        ok: false,
+        summary,
+        android_observation,
+    }
+}
+
 fn foreground_unavailable(
     summary: String,
     android_observation: Option<AndroidObservation>,
@@ -634,6 +777,7 @@ mod tests {
                 aosp_foreground_event_file: None,
                 aosp_background_supervisor_event_file: None,
                 aosp_app_launch_result_file: None,
+                aosp_notification_event_file: None,
             }
         );
     }
@@ -654,6 +798,7 @@ mod tests {
                 aosp_foreground_event_file: None,
                 aosp_background_supervisor_event_file: None,
                 aosp_app_launch_result_file: None,
+                aosp_notification_event_file: None,
             }
         );
     }
@@ -679,6 +824,7 @@ mod tests {
                 aosp_foreground_event_file: Some("/run/fawx/foreground.json".to_string()),
                 aosp_background_supervisor_event_file: None,
                 aosp_app_launch_result_file: None,
+                aosp_notification_event_file: None,
             }
         );
     }
@@ -706,6 +852,7 @@ mod tests {
                     "/run/fawx/background-supervisor.json".to_string()
                 ),
                 aosp_app_launch_result_file: None,
+                aosp_notification_event_file: None,
             }
         );
     }
@@ -731,6 +878,33 @@ mod tests {
                 aosp_foreground_event_file: None,
                 aosp_background_supervisor_event_file: None,
                 aosp_app_launch_result_file: Some("/run/fawx/app-launch.json".to_string()),
+                aosp_notification_event_file: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_aosp_notification_event_file() {
+        let args = parse_probe_args(
+            [
+                "--substrate",
+                "aosp-platform",
+                "--aosp-notification-event-file",
+                "/run/fawx/notification.json",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("notification event file should parse");
+
+        assert_eq!(
+            args,
+            ProbeArgs::Run {
+                substrate: AndroidSubstrate::AospPlatform,
+                aosp_foreground_event_file: None,
+                aosp_background_supervisor_event_file: None,
+                aosp_app_launch_result_file: None,
+                aosp_notification_event_file: Some("/run/fawx/notification.json".to_string()),
             }
         );
     }
@@ -762,7 +936,8 @@ mod tests {
 
     #[test]
     fn aosp_probe_uses_unavailable_platform_observation_until_adapter_exists() {
-        let observations = probe_observations(AndroidSubstrate::AospPlatform, None, None, None);
+        let observations =
+            probe_observations(AndroidSubstrate::AospPlatform, None, None, None, None);
 
         assert!(observations.iter().any(|observation| {
             observation.name == "aosp-platform-adapter"
@@ -803,6 +978,18 @@ mod tests {
                 })
             )
         }));
+        assert!(observations.iter().any(|observation| {
+            matches!(
+                observation
+                    .android_observation
+                    .as_ref()
+                    .map(|value| value.event()),
+                Some(AndroidEvent::NotificationUnavailable {
+                    reason: fawx_android_adapter::AndroidNotificationUnavailableReason::AdapterUnavailable,
+                    ..
+                })
+            )
+        }));
     }
 
     #[test]
@@ -827,6 +1014,7 @@ mod tests {
         let observations = probe_observations(
             AndroidSubstrate::AospPlatform,
             Some(event_path.to_str().expect("temp path should be utf8")),
+            None,
             None,
             None,
         );
@@ -869,6 +1057,7 @@ mod tests {
             Some(event_path.to_str().expect("temp path should be utf8")),
             None,
             None,
+            None,
         );
         let _ = std::fs::remove_file(event_path);
 
@@ -907,6 +1096,7 @@ mod tests {
             AndroidSubstrate::AospPlatform,
             None,
             Some(event_path.to_str().expect("temp path should be utf8")),
+            None,
             None,
         );
         let _ = std::fs::remove_file(event_path);
@@ -951,6 +1141,7 @@ mod tests {
             None,
             Some(event_path.to_str().expect("temp path should be utf8")),
             None,
+            None,
         );
         let _ = std::fs::remove_file(event_path);
 
@@ -990,6 +1181,7 @@ mod tests {
             None,
             None,
             Some(result_path.to_str().expect("temp path should be utf8")),
+            None,
         );
         let _ = std::fs::remove_file(result_path);
 
@@ -1003,6 +1195,48 @@ mod tests {
                 observation.android_observation.as_ref().map(|value| value.event()),
                 Some(AndroidEvent::AppLaunchCompleted { package_name, .. })
                     if package_name == "com.android.settings"
+            )
+        }));
+    }
+
+    #[test]
+    fn aosp_probe_can_ingest_privileged_notification_event_file() {
+        let event_path = std::env::temp_dir().join(format!(
+            "fawx-aosp-notification-event-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &event_path,
+            r#"{
+                "app_package_name": "com.example.mail",
+                "summary": "New message from Ada",
+                "source": {
+                    "service_name": "fawx-system-notification-listener",
+                    "event_id": "event-123"
+                }
+            }"#,
+        )
+        .expect("test event should write");
+
+        let observations = probe_observations(
+            AndroidSubstrate::AospPlatform,
+            None,
+            None,
+            None,
+            Some(event_path.to_str().expect("temp path should be utf8")),
+        );
+        let _ = std::fs::remove_file(event_path);
+
+        assert!(observations.iter().any(|observation| {
+            observation.name == "aosp-notification-listener"
+                && observation.ok
+                && observation.summary.contains("event source connected")
+        }));
+        assert!(observations.iter().any(|observation| {
+            matches!(
+                observation.android_observation.as_ref().map(|value| value.event()),
+                Some(AndroidEvent::NotificationReceived { source, summary })
+                    if source == "com.example.mail" && summary == "New message from Ada"
             )
         }));
     }

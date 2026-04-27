@@ -76,7 +76,7 @@ rooted/AOSP probes.
 | Foreground observation | Typed app/window focus events without shell parsing | Rooted recon uses `dumpsys`; AOSP has a typed event ingest seam, but no real service producer yet | 1 | Medium |
 | App launch/resume | Typed platform command with result evidence | AOSP has a typed app-controller result ingest seam, but no real service producer yet | 1 | Medium |
 | Background execution | Supervised long-running service below UI lifecycle | AOSP has a typed supervisor ingest seam, but no real service producer yet | 1 | High |
-| Notification read | Typed notification events with source/app metadata | Capability map says AOSP should own this; no adapter yet | U | High |
+| Notification read | Typed notification events with source/app metadata | AOSP has a typed notification-listener ingest seam, but no real service producer yet | 1 | High |
 | Notification post | Typed user-visible notification action | Requires AOSP privilege on rooted stock; no adapter yet | U | Medium |
 | Phone call | Typed call action with explicit user/policy grant | Requires AOSP privilege; no telephony adapter yet | U | High |
 | Messaging | Typed message action with contact/policy grant | Requires AOSP privilege; no messaging adapter yet | U | High |
@@ -166,8 +166,8 @@ The next AOSP-directed experiments should be:
 3. Background supervisor service: connect a real privileged service to the
    `fawx-system-background-supervisor` heartbeat seam and prove it survives app
    switching.
-4. Notification read bridge: prove typed notification events can enter the
-   runtime without app-level scraping.
+4. Notification read bridge: connect a real notification listener/system
+   service to the typed ingest seam.
 
 After those four, update the matrix. Do not use a plain average to decide the
 platform. AOSP should remain favored only if every must-have, high-exit-pressure

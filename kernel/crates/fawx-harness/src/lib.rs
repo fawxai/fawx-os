@@ -68,6 +68,11 @@ pub enum AppLaunchUnavailableReason {
     AdapterUnavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationUnavailableReason {
+    AdapterUnavailable,
+}
+
 /// Device-agnostic observations flowing into the harness policy layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeEvent {
@@ -101,6 +106,11 @@ pub enum RuntimeEvent {
     NotificationReceived {
         source: String,
         summary: String,
+    },
+    NotificationUnavailable {
+        target: String,
+        reason: NotificationUnavailableReason,
+        raw_source: Option<String>,
     },
     NetworkAvailabilityChanged {
         available: bool,
