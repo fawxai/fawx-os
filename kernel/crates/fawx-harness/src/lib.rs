@@ -9,7 +9,7 @@ use fawx_kernel::{
     AgentActionObservation, AgentActionStatus, AgentActivity, AgentActivityKind,
     AgentActivitySource, AgentActivityTarget, AttentionRequirement, ExecutionContract,
     HumanHandoffEvidence, HumanHandoffKind, HumanHandoffRequest, HumanHandoffResumeCondition,
-    SafetyCapability, SafetyRequirement, SafetyScope, TaskBlocker, TaskCheckpoint,
+    SafetyCapability, SafetyGrant, SafetyRequirement, SafetyScope, TaskBlocker, TaskCheckpoint,
 };
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -101,6 +101,8 @@ pub struct TaskState {
     #[serde(default)]
     pub current_handoff: Option<HumanHandoffRequest>,
     #[serde(default)]
+    pub pending_intent_approval: Option<PendingIntentApproval>,
+    #[serde(default)]
     pub completed_handoffs: Vec<HumanHandoffEvidence>,
 }
 
@@ -126,6 +128,7 @@ impl TaskState {
             action_sequence: 0,
             last_runtime_observation: None,
             current_handoff: None,
+            pending_intent_approval: None,
             completed_handoffs: vec![],
         }
     }
@@ -257,6 +260,32 @@ pub struct IntentCandidate {
     pub model_action: Option<ModelActionProposal>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IntentCandidateAuthority {
+    /// Direct owner input. The caller may add a narrow scoped grant before
+    /// submitting the candidate because the user is the authority source.
+    OwnerCommand,
+    /// Provider/model output. This path cannot mint authority; it must be
+    /// covered by existing policy or pause for owner confirmation.
+    ModelCandidate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CandidateAcceptanceDecision {
+    Accepted,
+    NeedsOwnerApproval {
+        reason: String,
+        missing_requirements: Vec<SafetyRequirement>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingIntentApproval {
+    pub candidate: IntentCandidate,
+    pub missing_requirements: Vec<SafetyRequirement>,
+    pub reason: String,
+}
+
 impl IntentCandidate {
     pub fn into_loop_proposals(
         self,
@@ -276,6 +305,132 @@ impl IntentCandidate {
             boundary_id_fragment(&self.candidate_id)
         )
     }
+}
+
+pub fn evaluate_intent_candidate_acceptance(
+    state: &TaskState,
+    candidate: &IntentCandidate,
+    authority: IntentCandidateAuthority,
+) -> Result<CandidateAcceptanceDecision, TaskTransitionError> {
+    ensure_not_terminal(state)?;
+    if let Some(blocker) = state.blocker.clone() {
+        return Err(TaskTransitionError::BlockedTask {
+            task_id: state.task_id.clone(),
+            blocker,
+        });
+    }
+
+    let Some(action) = &candidate.model_action else {
+        return Ok(CandidateAcceptanceDecision::Accepted);
+    };
+
+    validate_action_proposal(state, action)?;
+    if authority == IntentCandidateAuthority::OwnerCommand {
+        return Ok(CandidateAcceptanceDecision::Accepted);
+    }
+
+    let missing_requirements = missing_safety_requirements(state, action)?;
+    if missing_requirements.is_empty() {
+        Ok(CandidateAcceptanceDecision::Accepted)
+    } else {
+        Ok(CandidateAcceptanceDecision::NeedsOwnerApproval {
+            reason: owner_approval_reason(candidate, action),
+            missing_requirements,
+        })
+    }
+}
+
+pub fn apply_owner_command_grants_for_intent_candidate(
+    state: TaskState,
+    candidate: &IntentCandidate,
+) -> Result<TaskState, TaskTransitionError> {
+    ensure_not_terminal(&state)?;
+    if let Some(blocker) = state.blocker.clone() {
+        return Err(TaskTransitionError::BlockedTask {
+            task_id: state.task_id,
+            blocker,
+        });
+    }
+
+    let Some(action) = &candidate.model_action else {
+        return Ok(state);
+    };
+    validate_action_proposal(&state, action)?;
+    let missing_requirements = missing_safety_requirements(&state, action)?;
+    let mut state = state;
+    for requirement in missing_requirements {
+        state
+            .contract
+            .safety_grants
+            .push(safety_grant_from_requirement(requirement));
+    }
+    Ok(state)
+}
+
+pub fn require_owner_approval_for_intent_candidate(
+    state: TaskState,
+    candidate: &IntentCandidate,
+    reason: impl Into<String>,
+    missing_requirements: Vec<SafetyRequirement>,
+) -> Result<TaskState, TaskTransitionError> {
+    ensure_not_terminal(&state)?;
+    if let Some(blocker) = state.blocker.clone() {
+        return Err(TaskTransitionError::BlockedTask {
+            task_id: state.task_id,
+            blocker,
+        });
+    }
+
+    let mut state = state;
+    let reason = reason.into();
+    let target = candidate
+        .model_action
+        .as_ref()
+        .and_then(|action| action.target.clone())
+        .or_else(|| {
+            candidate
+                .model_activity
+                .as_ref()
+                .and_then(|activity| activity.target.clone())
+        });
+    let next_handoff = HumanHandoffRequest::new(
+        handoff_id_for(
+            &state.task_id,
+            &HumanHandoffResumeCondition::ExplicitUserApproval,
+        ),
+        HumanHandoffKind::UserApproval,
+        reason.clone(),
+        target,
+        HumanHandoffResumeCondition::ExplicitUserApproval,
+    )
+    .map_err(|_| TaskTransitionError::CheckpointClock)?;
+
+    state.phase = TaskPhase::Waiting;
+    state.mode = ExecutionMode::ForegroundAssisted;
+    state.attention_requirement = AttentionRequirement::ForegroundPreferred;
+    state.blocker = Some(TaskBlocker::WaitingForUserApproval {
+        reason: reason.clone(),
+    });
+    state.current_handoff = Some(preserve_matching_handoff(
+        state.current_handoff.take(),
+        next_handoff,
+    ));
+    state.pending_intent_approval = Some(PendingIntentApproval {
+        candidate: candidate.clone(),
+        missing_requirements,
+        reason,
+    });
+    state.current_activity = blocker_activity(&state.blocker)?;
+    mark_current_action(state, AgentActionStatus::Blocked)
+}
+
+fn owner_approval_reason(candidate: &IntentCandidate, action: &ModelActionProposal) -> String {
+    format!(
+        "model candidate {} from {} needs owner approval to {}",
+        candidate.candidate_id,
+        candidate.provider.provider_id,
+        action.reason.trim()
+    )
 }
 
 fn boundary_id_fragment(value: &str) -> String {
@@ -461,47 +616,20 @@ pub fn accept_model_action_proposal(
             blocker,
         });
     }
-    let reason = proposal.reason.trim();
-    if reason.is_empty() {
-        return Err(TaskTransitionError::InvalidAction {
-            task_id: state.task_id,
-            reason: "action reason must not be empty".to_string(),
-        });
-    }
-    if state
-        .current_action
-        .as_ref()
-        .is_some_and(current_action_is_open)
+    validate_action_proposal(&state, &proposal)?;
+    if let Some(requirement) = missing_safety_requirements(&state, &proposal)?
+        .into_iter()
+        .next()
     {
         return Err(TaskTransitionError::InvalidAction {
-            task_id: state.task_id,
-            reason: "cannot accept a new action while the current action is still open".to_string(),
-        });
-    }
-    validate_action_target(&proposal.kind, &proposal.target).map_err(|reason| {
-        TaskTransitionError::InvalidAction {
             task_id: state.task_id.clone(),
-            reason,
-        }
-    })?;
-    for requirement in
-        safety_requirements_for_action(&proposal.kind, &proposal.target).map_err(|reason| {
-            TaskTransitionError::InvalidAction {
-                task_id: state.task_id.clone(),
-                reason,
-            }
-        })?
-    {
-        if !state.contract.allows(&requirement) {
-            return Err(TaskTransitionError::InvalidAction {
-                task_id: state.task_id.clone(),
-                reason: format!(
-                    "missing safety grant {:?} for target {:?}",
-                    requirement.capability, requirement.scope
-                ),
-            });
-        }
+            reason: format!(
+                "missing safety grant {:?} for target {:?}",
+                requirement.capability, requirement.scope
+            ),
+        });
     }
+    let reason = proposal.reason.trim();
     let expected_observation = proposal
         .expected_observation
         .map(|value| value.trim().to_string())
@@ -723,6 +851,54 @@ fn validate_action_target(
     valid
         .then_some(())
         .ok_or_else(|| format!("action kind {kind:?} requires a compatible typed target"))
+}
+
+fn validate_action_proposal(
+    state: &TaskState,
+    proposal: &ModelActionProposal,
+) -> Result<(), TaskTransitionError> {
+    if proposal.reason.trim().is_empty() {
+        return Err(TaskTransitionError::InvalidAction {
+            task_id: state.task_id.clone(),
+            reason: "action reason must not be empty".to_string(),
+        });
+    }
+    if state
+        .current_action
+        .as_ref()
+        .is_some_and(current_action_is_open)
+    {
+        return Err(TaskTransitionError::InvalidAction {
+            task_id: state.task_id.clone(),
+            reason: "cannot accept a new action while the current action is still open".to_string(),
+        });
+    }
+    validate_action_target(&proposal.kind, &proposal.target).map_err(|reason| {
+        TaskTransitionError::InvalidAction {
+            task_id: state.task_id.clone(),
+            reason,
+        }
+    })
+}
+
+fn missing_safety_requirements(
+    state: &TaskState,
+    proposal: &ModelActionProposal,
+) -> Result<Vec<SafetyRequirement>, TaskTransitionError> {
+    Ok(
+        safety_requirements_for_action(&proposal.kind, &proposal.target)
+            .map_err(|reason| TaskTransitionError::InvalidAction {
+                task_id: state.task_id.clone(),
+                reason,
+            })?
+            .into_iter()
+            .filter(|requirement| !state.contract.allows(requirement))
+            .collect(),
+    )
+}
+
+fn safety_grant_from_requirement(requirement: SafetyRequirement) -> SafetyGrant {
+    SafetyGrant::scoped(requirement.capability, requirement.scope)
 }
 
 fn safety_requirements_for_action(
@@ -1215,11 +1391,57 @@ fn human_handoff_satisfied(
             handoff.target,
             "human handoff evidence accepted",
         )?);
+        state = resume_pending_intent_approval(state, &handoff.resume_condition)?;
         state = observe_current_action(state, &action_observation)?;
     } else {
         state.current_handoff = Some(handoff);
         state.current_activity = blocker_activity(&state.blocker)?;
         state = mark_current_action(state, AgentActionStatus::Blocked)?;
+    }
+    Ok(state)
+}
+
+fn resume_pending_intent_approval(
+    state: TaskState,
+    condition: &HumanHandoffResumeCondition,
+) -> Result<TaskState, TaskTransitionError> {
+    if condition != &HumanHandoffResumeCondition::ExplicitUserApproval {
+        return Ok(state);
+    }
+    let Some(pending) = state.pending_intent_approval.clone() else {
+        return Ok(state);
+    };
+
+    let mut state = state;
+    for requirement in &pending.missing_requirements {
+        if !state.contract.allows(requirement) {
+            state
+                .contract
+                .safety_grants
+                .push(safety_grant_from_requirement(requirement.clone()));
+        }
+    }
+    match evaluate_intent_candidate_acceptance(
+        &state,
+        &pending.candidate,
+        IntentCandidateAuthority::ModelCandidate,
+    )? {
+        CandidateAcceptanceDecision::Accepted => {}
+        CandidateAcceptanceDecision::NeedsOwnerApproval { reason, .. } => {
+            return Err(TaskTransitionError::InvalidAction {
+                task_id: state.task_id,
+                reason: format!("approved candidate still needs owner approval: {reason}"),
+            });
+        }
+    }
+
+    let (activity, action) = pending.candidate.into_loop_proposals();
+    state.pending_intent_approval = None;
+    if let Some(activity) = activity {
+        state = record_model_declared_activity(state, activity)?;
+    }
+    if let Some(action) = action {
+        state = accept_model_action_proposal(state, action)?;
     }
     Ok(state)
 }
@@ -1539,6 +1761,7 @@ mod tests {
             action_sequence: 0,
             last_runtime_observation: None,
             current_handoff: None,
+            pending_intent_approval: None,
             completed_handoffs: vec![],
         };
 
@@ -1568,6 +1791,7 @@ mod tests {
             action_sequence: 0,
             last_runtime_observation: None,
             current_handoff: None,
+            pending_intent_approval: None,
             completed_handoffs: vec![],
         };
 
@@ -1603,8 +1827,9 @@ mod tests {
         assert!(state.current_activity.is_none());
         assert!(state.current_action.is_none());
         assert!(state.current_handoff.is_none());
-        assert!(state.completed_handoffs.is_empty());
         assert_eq!(state.action_sequence, 0);
+        assert!(state.pending_intent_approval.is_none());
+        assert!(state.completed_handoffs.is_empty());
     }
 
     #[test]
@@ -3350,6 +3575,252 @@ mod tests {
 
         assert!(matches!(error, TaskTransitionError::InvalidAction { .. }));
         assert!(error.to_string().contains("missing safety grant"));
+    }
+
+    #[test]
+    fn model_candidate_requires_owner_approval_when_policy_is_missing() {
+        let candidate = IntentCandidate {
+            candidate_id: "candidate-1".to_string(),
+            provider: LocalModelProviderRef {
+                provider_id: "pixel-aicore-probe".to_string(),
+                locality: LocalModelLocality::DeviceLocal,
+            },
+            prompt: "open settings".to_string(),
+            model_activity: None,
+            model_action: Some(ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                reason: "open settings".to_string(),
+                expected_observation: Some("settings is foreground".to_string()),
+                proposal_id: None,
+            }),
+        };
+        let state = TaskState::new_background_task("task-1", "open settings");
+
+        let decision = evaluate_intent_candidate_acceptance(
+            &state,
+            &candidate,
+            IntentCandidateAuthority::ModelCandidate,
+        )
+        .expect("evaluate candidate");
+
+        assert!(matches!(
+            decision,
+            CandidateAcceptanceDecision::NeedsOwnerApproval {
+                missing_requirements,
+                ..
+            } if missing_requirements == vec![SafetyRequirement::new(
+                SafetyCapability::AppControl,
+                SafetyScope::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }
+            )]
+        ));
+    }
+
+    #[test]
+    fn model_candidate_is_accepted_when_existing_policy_covers_action() {
+        let candidate = IntentCandidate {
+            candidate_id: "candidate-1".to_string(),
+            provider: LocalModelProviderRef {
+                provider_id: "pixel-aicore-probe".to_string(),
+                locality: LocalModelLocality::DeviceLocal,
+            },
+            prompt: "open settings".to_string(),
+            model_activity: None,
+            model_action: Some(ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                reason: "open settings".to_string(),
+                expected_observation: Some("settings is foreground".to_string()),
+                proposal_id: None,
+            }),
+        };
+        let state = task_with_app_control("task-1", "open settings", "com.android.settings");
+
+        let decision = evaluate_intent_candidate_acceptance(
+            &state,
+            &candidate,
+            IntentCandidateAuthority::ModelCandidate,
+        )
+        .expect("evaluate candidate");
+
+        assert_eq!(decision, CandidateAcceptanceDecision::Accepted);
+    }
+
+    #[test]
+    fn owner_command_grants_are_applied_by_harness_before_acceptance() {
+        let candidate = IntentCandidate {
+            candidate_id: "candidate-1".to_string(),
+            provider: LocalModelProviderRef {
+                provider_id: "deterministic-session-parser".to_string(),
+                locality: LocalModelLocality::DeterministicFallback,
+            },
+            prompt: "open settings".to_string(),
+            model_activity: None,
+            model_action: Some(ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                reason: "open settings".to_string(),
+                expected_observation: Some("settings is foreground".to_string()),
+                proposal_id: None,
+            }),
+        };
+        let state = TaskState::new_background_task("task-1", "open settings");
+
+        let state = apply_owner_command_grants_for_intent_candidate(state, &candidate)
+            .expect("apply owner grants");
+        let decision = evaluate_intent_candidate_acceptance(
+            &state,
+            &candidate,
+            IntentCandidateAuthority::OwnerCommand,
+        )
+        .expect("evaluate candidate");
+
+        assert_eq!(decision, CandidateAcceptanceDecision::Accepted);
+        assert!(state.contract.allows(&SafetyRequirement::new(
+            SafetyCapability::AppControl,
+            SafetyScope::AndroidPackage {
+                package_name: "com.android.settings".to_string(),
+            }
+        )));
+    }
+
+    #[test]
+    fn missing_model_candidate_policy_creates_typed_owner_handoff() {
+        let candidate = IntentCandidate {
+            candidate_id: "candidate-1".to_string(),
+            provider: LocalModelProviderRef {
+                provider_id: "pixel-aicore-probe".to_string(),
+                locality: LocalModelLocality::DeviceLocal,
+            },
+            prompt: "open settings".to_string(),
+            model_activity: None,
+            model_action: Some(ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                reason: "open settings".to_string(),
+                expected_observation: Some("settings is foreground".to_string()),
+                proposal_id: None,
+            }),
+        };
+        let state = TaskState::new_background_task("task-1", "open settings");
+        let reason = "owner approval required";
+
+        let missing_requirements = vec![SafetyRequirement::new(
+            SafetyCapability::AppControl,
+            SafetyScope::AndroidPackage {
+                package_name: "com.android.settings".to_string(),
+            },
+        )];
+        let state = require_owner_approval_for_intent_candidate(
+            state,
+            &candidate,
+            reason,
+            missing_requirements.clone(),
+        )
+        .expect("request approval");
+
+        assert_eq!(state.phase, TaskPhase::Waiting);
+        assert_eq!(
+            state.blocker,
+            Some(TaskBlocker::WaitingForUserApproval {
+                reason: reason.to_string(),
+            })
+        );
+        let handoff = state.current_handoff.expect("handoff");
+        assert_eq!(handoff.kind, HumanHandoffKind::UserApproval);
+        assert_eq!(
+            handoff.resume_condition,
+            HumanHandoffResumeCondition::ExplicitUserApproval
+        );
+        assert!(matches!(
+            handoff.target,
+            Some(AgentActivityTarget::AndroidPackage { package_name })
+                if package_name == "com.android.settings"
+        ));
+        let pending = state.pending_intent_approval.expect("pending approval");
+        assert_eq!(pending.candidate, candidate);
+        assert_eq!(pending.missing_requirements, missing_requirements);
+    }
+
+    #[test]
+    fn approving_pending_model_candidate_installs_grants_and_accepts_same_action() {
+        let candidate = IntentCandidate {
+            candidate_id: "candidate-1".to_string(),
+            provider: LocalModelProviderRef {
+                provider_id: "pixel-aicore-probe".to_string(),
+                locality: LocalModelLocality::DeviceLocal,
+            },
+            prompt: "open settings".to_string(),
+            model_activity: Some(ModelActivityProposal {
+                kind: ModelActivityKind::Planning,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                description: "open settings".to_string(),
+            }),
+            model_action: Some(ModelActionProposal {
+                kind: ModelActionKind::OpenApp,
+                target: Some(AgentActivityTarget::AndroidPackage {
+                    package_name: "com.android.settings".to_string(),
+                }),
+                reason: "open settings".to_string(),
+                expected_observation: Some("settings is foreground".to_string()),
+                proposal_id: None,
+            }),
+        };
+        let missing_requirements = vec![SafetyRequirement::new(
+            SafetyCapability::AppControl,
+            SafetyScope::AndroidPackage {
+                package_name: "com.android.settings".to_string(),
+            },
+        )];
+        let state = require_owner_approval_for_intent_candidate(
+            TaskState::new_background_task("task-1", "open settings"),
+            &candidate,
+            "owner approval required",
+            missing_requirements,
+        )
+        .expect("request approval");
+
+        let state = satisfy_human_handoff(
+            state,
+            RuntimeObservation {
+                source: RuntimeObservationSource::Shell {
+                    name: "test".to_string(),
+                },
+                event: RuntimeEvent::HumanHandoffCompleted {
+                    handoff_id: "handoff:task-1:user-approval".to_string(),
+                    summary: "approved".to_string(),
+                },
+            },
+        )
+        .expect("approve candidate");
+
+        assert!(state.pending_intent_approval.is_none());
+        assert!(state.current_handoff.is_none());
+        assert!(state.blocker.is_none());
+        assert!(state.contract.allows(&SafetyRequirement::new(
+            SafetyCapability::AppControl,
+            SafetyScope::AndroidPackage {
+                package_name: "com.android.settings".to_string(),
+            }
+        )));
+        let action = state.current_action.expect("accepted action");
+        assert_eq!(action.status, AgentActionStatus::Accepted);
+        assert_eq!(
+            action.boundary.id,
+            "intent-candidate:pixel-aicore-probe:candidate-1"
+        );
     }
 
     #[test]

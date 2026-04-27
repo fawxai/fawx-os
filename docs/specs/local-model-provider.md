@@ -94,3 +94,29 @@ The terminal session has two explicit sources:
   grant needed by the command.
 - `ModelCandidate` for provider-generated candidates. This path must never mint
   grants; it depends on existing policy or a separate owner confirmation.
+
+## Candidate Acceptance Policy
+
+Candidate acceptance is a typed policy step, not a side effect of the terminal
+runner.
+
+The current policy has three important cases:
+
+- `OwnerCommand`: accepted as direct owner intent after the caller adds only the
+  narrow grant required by the exact command target.
+- `ModelCandidate` with existing scoped policy: accepted and routed into the
+  normal loop proposal path.
+- `ModelCandidate` without scoped policy: paused with a typed
+  `UserApproval` handoff and a `WaitingForUserApproval` blocker.
+
+This keeps friction out of deterministic owner commands while preventing model
+output from becoming authority. Future UX can render this as a compact
+"Fawx wants to do X" confirmation, but the backend contract is already explicit.
+
+When a model candidate pauses for approval, `TaskState.pending_intent_approval`
+persists the candidate and exact missing safety requirements. Approval/resume
+logic must install those typed requirements before re-evaluating and accepting
+the same candidate; it must not reconstruct authority from prose.
+
+`fawx-terminal-runner candidate-dry-run <prompt>` now reports the candidate and
+the policy decision without executing the action.
