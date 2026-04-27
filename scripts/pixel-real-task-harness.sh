@@ -121,6 +121,23 @@ assert_json "$status_output" '.state.current_action.boundary.state == "Committed
 assert_json "$status_output" '.state.current_action.last_observation.evidence.ForegroundPackage.package_name == "com.android.settings"' "foreground evidence is attached to action"
 pass_case
 
+begin_case "notification read action refuses terminal-minted listener evidence"
+run_runner "create task-notification-read 'prove notification read requires listener provenance'" >/dev/null
+run_runner "grant task-notification-read notifications-read notifications" >/dev/null
+notification_accept="$(run_runner "agent-step task-notification-read --action-kind read --action-reason 'read notification surface' --action-target notifications --expected-observation 'notification evidence is available'")"
+echo "$notification_accept"
+assert_json "$notification_accept" '.task.state.current_action.status == "Accepted"' "notification read action is accepted"
+notification_begin="$(run_runner "begin-action task-notification-read")"
+echo "$notification_begin"
+assert_json "$notification_begin" '.state.current_action.status == "Executing"' "notification read action begins execution"
+notification_observed="$(run_runner "observe-notification task-notification-read com.example.mail 'New message from Ada'")"
+echo "$notification_observed"
+assert_json "$notification_observed" '.task.state.current_action.status == "Executing"' "terminal notification observation does not close action"
+assert_json "$notification_observed" '.task.state.current_action.boundary.state == "Prepared"' "notification read boundary stays prepared without listener provenance"
+assert_json "$notification_observed" '.task.state.current_action.last_observation == null' "unproven notification evidence is not attached to action"
+assert_json "$notification_observed" '.task.state.last_runtime_observation.source.Shell.name == "fawx-terminal-runner"' "manual notification observation is marked as shell evidence"
+pass_case
+
 begin_case "foreground handoff resumes from matching foreground observation"
 run_runner "create task-settings-handoff 'prove foreground handoff evidence'" >/dev/null
 handoff_output="$(run_runner "agent-step task-settings-handoff --expected-foreground com.android.settings")"

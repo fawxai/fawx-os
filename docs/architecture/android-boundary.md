@@ -12,7 +12,9 @@ Its job is to prevent two failure modes:
 The solution is an explicit contract.
 
 This boundary should be interpreted alongside
-`docs/architecture/aosp-escape-analysis.md`. The Android adapter is not only a
+`docs/architecture/aosp-escape-analysis.md`,
+`docs/architecture/aosp-service-bridge.md`, and
+`docs/architecture/aosp-prototype-plan.md`. The Android adapter is not only a
 build plan; it is also an evidence-gathering surface for deciding whether AOSP
 is sufficient or whether Fawx OS needs a more controllable Linux-based
 foundation.
@@ -347,6 +349,15 @@ read. They target `NotificationSurface`, require the `NotificationsRead` safety
 grant, and can only close a current `Read`/`Observe`/`Verify` action when the
 runtime receives typed `NotificationReceived` evidence. This keeps notification
 truth structurally separate from both network services and shell/recon output.
+
+Sensitive action surfaces follow the same honesty rule. Notification posting,
+messaging, and telephony now have typed AOSP unavailable observations, but no
+real privileged adapters yet. The default AOSP probe must emit
+`NotificationPostUnavailable(AdapterUnavailable)`,
+`MessageUnavailable(AdapterUnavailable)`, and
+`PhoneCallUnavailable(AdapterUnavailable)` until platform services can produce
+auditable success evidence. This prevents a missing high-risk primitive from
+being hidden behind prose, absent tools, or a generic action failure.
 
 ## Minimum First-Implementation Contract
 

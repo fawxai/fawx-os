@@ -8,9 +8,10 @@ use fawx_android_adapter::{
     aosp_app_launch_observation_from_platform_result_json, aosp_app_launch_unavailable_observation,
     aosp_background_supervisor_observation_from_platform_event_json,
     aosp_background_supervisor_unavailable_observation,
-    aosp_foreground_observation_from_platform_event_json,
+    aosp_foreground_observation_from_platform_event_json, aosp_message_unavailable_observation,
     aosp_notification_observation_from_platform_event_json,
-    aosp_notification_unavailable_observation, aosp_platform_adapter_unavailable_observation,
+    aosp_notification_post_unavailable_observation, aosp_notification_unavailable_observation,
+    aosp_phone_call_unavailable_observation, aosp_platform_adapter_unavailable_observation,
     foreground_observation, run_recon_command,
 };
 use serde::Serialize;
@@ -223,6 +224,18 @@ fn probe_observations(
                     &notification_event_observation,
                 ),
                 notification_probe_observation(notification_event_observation),
+                unavailable_action_probe_observation(
+                    "notification-post",
+                    aosp_notification_post_unavailable_observation("notification-post"),
+                ),
+                unavailable_action_probe_observation(
+                    "messaging",
+                    aosp_message_unavailable_observation("messaging"),
+                ),
+                unavailable_action_probe_observation(
+                    "phone-call",
+                    aosp_phone_call_unavailable_observation("phone-call"),
+                ),
             ]
         }
     }
@@ -750,6 +763,42 @@ fn notification_unavailable(
     }
 }
 
+fn unavailable_action_probe_observation(
+    name: &str,
+    observation: AndroidObservation,
+) -> ProbeObservation {
+    ProbeObservation {
+        name: name.to_string(),
+        ok: false,
+        summary: match observation.event() {
+            AndroidEvent::NotificationPostUnavailable {
+                reason, raw_source, ..
+            } => unavailable_action_summary(name, reason, raw_source.as_deref()),
+            AndroidEvent::MessageUnavailable {
+                reason, raw_source, ..
+            } => unavailable_action_summary(name, reason, raw_source.as_deref()),
+            AndroidEvent::PhoneCallUnavailable {
+                reason, raw_source, ..
+            } => unavailable_action_summary(name, reason, raw_source.as_deref()),
+            _ => format!("{name} unavailable: unexpected observation"),
+        },
+        android_observation: Some(observation),
+    }
+}
+
+fn unavailable_action_summary(
+    name: &str,
+    reason: impl std::fmt::Debug,
+    raw_source: Option<&str>,
+) -> String {
+    match raw_source {
+        Some(raw_source) if !raw_source.is_empty() => {
+            format!("{name} unavailable: {reason:?}; raw_source={raw_source}")
+        }
+        _ => format!("{name} unavailable: {reason:?}"),
+    }
+}
+
 fn foreground_unavailable(
     summary: String,
     android_observation: Option<AndroidObservation>,
@@ -986,6 +1035,41 @@ mod tests {
                     .map(|value| value.event()),
                 Some(AndroidEvent::NotificationUnavailable {
                     reason: fawx_android_adapter::AndroidNotificationUnavailableReason::AdapterUnavailable,
+                    ..
+                })
+            )
+        }));
+        assert!(observations.iter().any(|observation| {
+            matches!(
+                observation.android_observation.as_ref().map(|value| value.event()),
+                Some(AndroidEvent::NotificationPostUnavailable {
+                    reason: fawx_android_adapter::AndroidNotificationPostUnavailableReason::AdapterUnavailable,
+                    ..
+                })
+            )
+        }));
+        assert!(observations.iter().any(|observation| {
+            matches!(
+                observation
+                    .android_observation
+                    .as_ref()
+                    .map(|value| value.event()),
+                Some(AndroidEvent::MessageUnavailable {
+                    reason:
+                        fawx_android_adapter::AndroidMessageUnavailableReason::AdapterUnavailable,
+                    ..
+                })
+            )
+        }));
+        assert!(observations.iter().any(|observation| {
+            matches!(
+                observation
+                    .android_observation
+                    .as_ref()
+                    .map(|value| value.event()),
+                Some(AndroidEvent::PhoneCallUnavailable {
+                    reason:
+                        fawx_android_adapter::AndroidPhoneCallUnavailableReason::AdapterUnavailable,
                     ..
                 })
             )

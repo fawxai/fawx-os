@@ -20,9 +20,9 @@ Foreground observation      1      Medium         typed foreground ingest seam; 
 App launch/resume           1      Medium         typed app-controller ingest seam; no real AOSP service producer yet
 Background execution        1      High           typed supervisor ingest seam; no real AOSP service producer yet
 Notification read           1      High           typed notification ingest seam; no real AOSP service producer yet
-Notification post           U      Medium         requires AOSP privilege; no adapter yet
-Phone call                  U      High           no telephony adapter yet
-Messaging                   U      High           no messaging adapter yet
+Notification post           U      Medium         typed unavailable seam; no real AOSP poster yet
+Phone call                  U      High           typed unavailable seam; no telephony adapter yet
+Messaging                   U      High           typed unavailable seam; no messaging adapter yet
 Shared storage read/write   1      Medium         rooted paths only; no scoped platform mediator
 Local model access          1      Medium         AICore/Gemini detected; no inference adapter
 UI automation/computer use  U      High           no background-capable control surface
@@ -33,6 +33,8 @@ Next evidence gates:
 2. Connect AOSP app-launch AdapterUnavailable to a real app-controller result.
 3. Connect a real AOSP service to the background supervisor event seam.
 4. Connect AOSP notification AdapterUnavailable to a real listener event.
+5. Connect notification post, messaging, and telephony unavailable seams to
+   real privileged adapters, or keep them explicitly unavailable.
 
 Decision gate:
 - Must-have primitives: background execution, foreground/window observation,

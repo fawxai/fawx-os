@@ -11,15 +11,18 @@ use fawx_agent_loop::{
 use fawx_android_adapter::{
     AndroidActionRequest, AndroidAppLaunchUnavailableReason,
     AndroidBackgroundSupervisorUnavailableReason, AndroidCommand, AndroidEvent,
-    AndroidForegroundUnavailableReason, AndroidNotificationUnavailableReason, AndroidObservation,
-    AndroidObservationProvenance, AndroidSubstrate, CommandOutput, LocalModelProbeReport,
-    execute_android_action_request, foreground_observation, local_model_probe,
+    AndroidForegroundUnavailableReason, AndroidMessageUnavailableReason,
+    AndroidNotificationPostUnavailableReason, AndroidNotificationUnavailableReason,
+    AndroidObservation, AndroidObservationProvenance, AndroidPhoneCallUnavailableReason,
+    AndroidSubstrate, CommandOutput, LocalModelProbeReport, execute_android_action_request,
+    foreground_observation, local_model_probe,
 };
 use fawx_harness::{
     AppLaunchUnavailableReason, BackgroundSupervisorUnavailableReason, CandidateAcceptanceDecision,
     ForegroundPolicyDecision, ForegroundUnavailableReason, IntentCandidate,
-    IntentCandidateAuthority, LocalModelLocality, LocalModelProviderRef, ModelActionKind,
-    ModelActionProposal, ModelActivityKind, ModelActivityProposal, NotificationUnavailableReason,
+    IntentCandidateAuthority, LocalModelLocality, LocalModelProviderRef, MessageUnavailableReason,
+    ModelActionKind, ModelActionProposal, ModelActivityKind, ModelActivityProposal,
+    NotificationPostUnavailableReason, NotificationUnavailableReason, PhoneCallUnavailableReason,
     RuntimeEvent, RuntimeObservation, RuntimeObservationSource, RuntimePlatformEventSource,
     TaskState, TaskTransitionError, apply_foreground_policy,
     apply_owner_command_grants_for_intent_candidate, begin_current_action_execution,
@@ -124,6 +127,12 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         "execute-action" => {
             let task_id = required_arg(&args, 1, "task id")?;
             run_execute_action(&store, task_id)?;
+        }
+        "observe-notification" => {
+            let task_id = required_arg(&args, 1, "task id")?;
+            let source = required_arg(&args, 2, "notification source")?;
+            let summary = joined_tail(&args, 3, "notification summary")?;
+            run_observe_notification(&store, task_id, source, summary)?;
         }
         "local-model-probe" => {
             run_local_model_probe()?;
@@ -1006,6 +1015,41 @@ fn run_execute_action(store: &TaskStore, task_id: &str) -> Result<(), Box<dyn Er
     Ok(())
 }
 
+fn run_observe_notification(
+    store: &TaskStore,
+    task_id: &str,
+    source: &str,
+    summary: String,
+) -> Result<(), Box<dyn Error>> {
+    validate_android_package_target(source)?;
+    let observation = RuntimeObservation {
+        source: RuntimeObservationSource::Shell {
+            name: "fawx-terminal-runner".to_string(),
+        },
+        event: RuntimeEvent::NotificationReceived {
+            source: source.to_string(),
+            summary,
+        },
+    };
+    let loop_runner = AgentLoop::new(store.clone());
+    let result = loop_runner.step(LoopStepRequest {
+        task_id: task_id.to_string(),
+        observations: vec![observation],
+        expected_foreground_package: None,
+        model_activity: None,
+        model_action: None,
+    })?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "task": result.task,
+            "decision": result.decision,
+        }))?
+    );
+    Ok(())
+}
+
 fn run_local_model_probe() -> Result<(), Box<dyn Error>> {
     let report = local_model_probe(AndroidSubstrate::ReconRootedStock);
     println!("{}", local_model_probe_json(&report)?);
@@ -1587,6 +1631,45 @@ fn runtime_observation_from_android(observation: &AndroidObservation) -> Runtime
                 },
                 raw_source: raw_source.clone(),
             },
+            AndroidEvent::NotificationPostUnavailable {
+                target,
+                reason,
+                raw_source,
+            } => RuntimeEvent::NotificationPostUnavailable {
+                target: target.clone(),
+                reason: match reason {
+                    AndroidNotificationPostUnavailableReason::AdapterUnavailable => {
+                        NotificationPostUnavailableReason::AdapterUnavailable
+                    }
+                },
+                raw_source: raw_source.clone(),
+            },
+            AndroidEvent::MessageUnavailable {
+                target,
+                reason,
+                raw_source,
+            } => RuntimeEvent::MessageUnavailable {
+                target: target.clone(),
+                reason: match reason {
+                    AndroidMessageUnavailableReason::AdapterUnavailable => {
+                        MessageUnavailableReason::AdapterUnavailable
+                    }
+                },
+                raw_source: raw_source.clone(),
+            },
+            AndroidEvent::PhoneCallUnavailable {
+                target,
+                reason,
+                raw_source,
+            } => RuntimeEvent::PhoneCallUnavailable {
+                target: target.clone(),
+                reason: match reason {
+                    AndroidPhoneCallUnavailableReason::AdapterUnavailable => {
+                        PhoneCallUnavailableReason::AdapterUnavailable
+                    }
+                },
+                raw_source: raw_source.clone(),
+            },
             AndroidEvent::NetworkAvailabilityChanged { available } => {
                 RuntimeEvent::NetworkAvailabilityChanged {
                     available: *available,
@@ -1805,6 +1888,9 @@ fn print_usage() {
     );
     eprintln!("  fawx-terminal-runner begin-action <task-id>");
     eprintln!("  fawx-terminal-runner execute-action <task-id>");
+    eprintln!(
+        "  fawx-terminal-runner observe-notification <task-id> <source-package> <summary>  # manual shell evidence, not AOSP listener proof"
+    );
     eprintln!("  fawx-terminal-runner local-model-probe");
     eprintln!("  fawx-terminal-runner candidate-dry-run <prompt>");
     eprintln!("  fawx-terminal-runner session");

@@ -77,9 +77,9 @@ rooted/AOSP probes.
 | App launch/resume | Typed platform command with result evidence | AOSP has a typed app-controller result ingest seam, but no real service producer yet | 1 | Medium |
 | Background execution | Supervised long-running service below UI lifecycle | AOSP has a typed supervisor ingest seam, but no real service producer yet | 1 | High |
 | Notification read | Typed notification events with source/app metadata | AOSP has a typed notification-listener ingest seam, but no real service producer yet | 1 | High |
-| Notification post | Typed user-visible notification action | Requires AOSP privilege on rooted stock; no adapter yet | U | Medium |
-| Phone call | Typed call action with explicit user/policy grant | Requires AOSP privilege; no telephony adapter yet | U | High |
-| Messaging | Typed message action with contact/policy grant | Requires AOSP privilege; no messaging adapter yet | U | High |
+| Notification post | Typed user-visible notification action | AOSP has a typed unavailable seam; no real poster service yet | U | Medium |
+| Phone call | Typed call action with explicit user/policy grant | AOSP has a typed unavailable seam; no real telephony adapter yet | U | High |
+| Messaging | Typed message action with contact/policy grant | AOSP has a typed unavailable seam; no real messaging adapter yet | U | High |
 | Shared storage read/write | Scoped file grants and evidence | Rooted recon is path-limited; AOSP mediation not implemented | 1 | Medium |
 | Local model access | Device-local model provider emits `IntentCandidate` | AICore/Gemini packages can be detected; no public inference adapter | 1 | Medium |
 | UI automation/computer use | Background-capable action surface with verifiable observations | Not implemented; foreground app control only | U | High |
@@ -168,6 +168,9 @@ The next AOSP-directed experiments should be:
    switching.
 4. Notification read bridge: connect a real notification listener/system
    service to the typed ingest seam.
+5. Sensitive action adapters: connect notification post, messaging, and
+   telephony unavailable seams to real privileged services, or keep them
+   explicitly unavailable until the permission and UX contracts are ready.
 
 After those four, update the matrix. Do not use a plain average to decide the
 platform. AOSP should remain favored only if every must-have, high-exit-pressure
