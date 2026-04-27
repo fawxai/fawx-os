@@ -46,9 +46,10 @@ fawx-os/
 └── scripts/  # Build and validation scripts
 ```
 
-## Foundation Decisions
+## Foundation Hypotheses
 
-- Base mobile substrate: AOSP-first
+- Base mobile substrate hypothesis: AOSP-first, evidence-gated by rooted Pixel
+  probes before any capital-intensive checkout/build work
 - Core implementation language: Rust
 - Android framework dependence: minimize and isolate
 - Local/cloud split: local by default, cloud when necessary
@@ -98,6 +99,16 @@ producer. Before attempting any AOSP checkout or flash, run:
 ```
 
 AOSP source and build artifacts intentionally live outside this repository.
+
+Before spending money on storage or cloud build capacity, run the capital-free
+substrate decision sprint:
+
+```sh
+./scripts/pixel-substrate-decision-sprint.sh
+```
+
+That report keeps the AOSP decision tied to typed evidence from the rooted Pixel
+instead of optimism about what a full platform build might unlock.
 
 Before review, run:
 
